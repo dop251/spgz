@@ -1,7 +1,7 @@
 package main
 
 import (
-	"code.itoolabs.com/go/spgz"
+	"github.com/dop251/spgz"
 	"flag"
 	"fmt"
 	"io"
