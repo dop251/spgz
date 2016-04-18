@@ -15,7 +15,7 @@ const (
 )
 
 const (
-	defBlockSize = 1*1024*1024 - 1
+	defBlockSize = 128 * 1024 - 1
 )
 
 const (
@@ -438,7 +438,14 @@ func (f *compFile) Close() error {
 	return f.f.Close()
 }
 
-func (f *compFile) init(flag int) error {
+func (f *compFile) init(flag int, blockSize int64) error {
+	blockSize &= 0xffffffffffff000
+	if blockSize == 0 {
+		blockSize = defBlockSize
+	} else {
+		blockSize--
+	}
+
 	f.block.init(f)
 
 	// Trying to read the header
@@ -451,12 +458,12 @@ func (f *compFile) init(flag int) error {
 			if flag&os.O_WRONLY != 0 || flag&os.O_RDWR != 0 {
 				w := bytes.NewBuffer(buf[:0])
 				w.WriteString(headerMagic)
-				binary.Write(w, binary.LittleEndian, uint32((defBlockSize+1)/4096))
+				binary.Write(w, binary.LittleEndian, uint32((blockSize+1)/4096))
 				_, err = f.f.Write(w.Bytes())
 				if err != nil {
 					return err
 				}
-				f.blockSize = defBlockSize
+				f.blockSize = blockSize
 				return nil
 			}
 		}
@@ -476,6 +483,10 @@ func (f *compFile) init(flag int) error {
 }
 
 func OpenFile(name string, flag int, perm os.FileMode) (f *compFile, err error) {
+	return OpenFileSize(name, flag, perm, 0)
+}
+
+func OpenFileSize(name string, flag int, perm os.FileMode, blockSize int64) (f *compFile, err error) {
 	var ff *os.File
 	ff, err = os.OpenFile(name, flag, perm)
 	if err != nil {
@@ -486,7 +497,7 @@ func OpenFile(name string, flag int, perm os.FileMode) (f *compFile, err error) 
 		f: NewSparseFile(ff),
 	}
 
-	err = f.init(flag)
+	err = f.init(flag, blockSize)
 	if err != nil {
 		f.f.Close()
 		return nil, err
@@ -496,6 +507,10 @@ func OpenFile(name string, flag int, perm os.FileMode) (f *compFile, err error) 
 }
 
 func NewFromFile(file *os.File, flag int) (f *compFile, err error) {
+	return NewFromFileSize(file, flag, 0)
+}
+
+func NewFromFileSize(file *os.File, flag int, blockSize int64) (f *compFile, err error) {
 	info, err := file.Stat()
 	if err != nil {
 		return nil, err
@@ -508,7 +523,7 @@ func NewFromFile(file *os.File, flag int) (f *compFile, err error) {
 		f: NewSparseFile(file),
 	}
 
-	err = f.init(flag)
+	err = f.init(flag, blockSize)
 	if err != nil {
 		return nil, err
 	}
@@ -517,11 +532,15 @@ func NewFromFile(file *os.File, flag int) (f *compFile, err error) {
 }
 
 func NewFromSparseFile(file SparseFile, flag int) (f *compFile, err error) {
+	return NewFromSparseFileSize(file, flag, 0)
+}
+
+func NewFromSparseFileSize(file SparseFile, flag int, blockSize int64) (f *compFile, err error) {
 	f = &compFile{
 		f: file,
 	}
 
-	err = f.init(flag)
+	err = f.init(flag, blockSize)
 	if err != nil {
 		return nil, err
 	}
