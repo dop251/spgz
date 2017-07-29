@@ -51,15 +51,7 @@ type SparseWriter struct {
 }
 
 func (w *SparseWriter) Write(p []byte) (int, error) {
-	zero := true
-	for i := 0; i < len(p); i++ {
-		if p[i] != 0 {
-			zero = false
-			break
-		}
-	}
-
-	if zero {
+	if IsBlockZero(p) {
 		offset, err := w.SparseFile.Seek(0, os.SEEK_CUR)
 		if err != nil {
 			return 0, err
