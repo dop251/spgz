@@ -7,7 +7,13 @@ import (
 	"io"
 	"log"
 	"os"
-	"syscall"
+)
+
+type fileType int
+const (
+	_FTYPE_FILE    fileType = iota
+	_FTYPE_BLKDEV
+	_FTYPE_STREAM
 )
 
 func usage() {
@@ -15,16 +21,23 @@ func usage() {
 	os.Exit(2)
 }
 
-func isDev(f *os.File) (bool, error) {
+func getFileType(f *os.File) (fileType, error) {
 	info, err := f.Stat()
 	if err != nil {
-		return false, err
+		return _FTYPE_FILE, err
 	}
-	s, ok := info.Sys().(*syscall.Stat_t)
-	if ok {
-		return s.Rdev != 0, nil
+
+	mode := info.Mode()
+	if !mode.IsRegular() {
+		if mode & (os.ModeCharDevice | os.ModeNamedPipe | os.ModeSocket) != 0 {
+			return _FTYPE_STREAM, nil
+		}
+		if mode & os.ModeDevice != 0 {
+			return _FTYPE_BLKDEV, nil
+		}
 	}
-	return false, nil
+
+	return _FTYPE_FILE, nil
 }
 
 func main() {
@@ -52,18 +65,28 @@ func main() {
 		}
 		defer f.Close()
 
-		out, err := os.OpenFile(name, os.O_RDWR|os.O_CREATE, 0640)
-		if err != nil {
-			log.Fatalf("Could not open output file: %v", err)
+		var (
+			out   *os.File
+			ftype fileType
+		)
+
+		if name == "-" {
+			out = os.Stdout
+		} else {
+			out, err = os.OpenFile(name, os.O_RDWR|os.O_CREATE, 0640)
+			if err != nil {
+				log.Fatalf("Could not open output file: %v", err)
+			}
 		}
 
-		var w io.WriteCloser
-		dev, err := isDev(out)
+		ftype, err = getFileType(out)
 		if err != nil {
 			out.Close()
 			log.Fatalf("Could not determine the target file type: %v", err)
 		}
-		if dev {
+
+		var w io.WriteCloser
+		if ftype == _FTYPE_BLKDEV {
 			size, err := out.Seek(0, os.SEEK_END)
 			if err != nil {
 				log.Fatalf("Could not determine target device size: %v", err)
@@ -81,11 +104,13 @@ func main() {
 			}
 			w = out
 		} else {
-			err = out.Truncate(0)
-			if err != nil {
-				log.Printf("Truncate() failed: %v", err)
+			if ftype == _FTYPE_FILE {
+				err = out.Truncate(0)
+				if err != nil {
+					log.Printf("Truncate() failed: %v", err)
+				}
 			}
-			if *noSparse {
+			if *noSparse || ftype != _FTYPE_FILE {
 				w = out
 			} else {
 				w = spgz.NewSparseWriter(spgz.NewSparseFile(out))
