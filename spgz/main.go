@@ -17,8 +17,8 @@ const (
 )
 
 func usage() {
-	fmt.Fprintf(os.Stderr, "Compress:\n    %[1]s -c <compressed_file> <source>\n\nExtract:\n    %[1]s -x <compressed_file> [--no-sparse] <target>\n", os.Args[0])
-	os.Exit(2)
+	fmt.Fprintf(os.Stderr, "Compress:\n    %[1]s -c <compressed_file> <source>\n\nExtract:\n    %[1]s -x <compressed_file> [--no-sparse] <target>\n\nGet original size:\n    %[1]s -s <compressed_file>\n", os.Args[0])
+	os.Exit(1)
 }
 
 func getFileType(f *os.File) (fileType, error) {
@@ -40,25 +40,25 @@ func getFileType(f *os.File) (fileType, error) {
 	return _FTYPE_FILE, nil
 }
 
+func failOptions() {
+	fmt.Fprint(os.Stderr, "-c, -s, and -x are mutually exclusive\n\n")
+	usage()
+}
+
 func main() {
 	var create = flag.String("c", "", "Create compressed file")
 	var extract = flag.String("x", "", "Extract compressed file")
+	var size = flag.String("s", "", "Get original size in bytes")
 	var noSparse = flag.Bool("no-sparse", false, "Disable sparse file")
 
 	flag.Parse()
 
 	name := flag.Arg(0)
 
-	if *create == "" && *extract == "" {
-		usage()
-	}
-
-	if *create != "" && *extract != "" {
-		fmt.Fprintf(os.Stderr, "-c and -x are mutually exclusive")
-		usage()
-	}
-
 	if *extract != "" {
+		if *create != "" || *size != "" {
+			failOptions()
+		}
 		f, err := spgz.OpenFile(*extract, os.O_RDONLY, 0666)
 		if err != nil {
 			log.Fatalf("Could not open compressed file: %v", err)
@@ -123,10 +123,9 @@ func main() {
 		if err != nil {
 			log.Fatalf("Copy failed: %v", err)
 		}
-	} else {
-		f, err := spgz.OpenFile(*create, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0666)
-		if err != nil {
-			log.Fatalf("Could not open file: %v", err)
+	} else if *create != "" {
+		if *size != "" {
+			failOptions()
 		}
 
 		var in io.Reader
@@ -140,6 +139,11 @@ func main() {
 			in = os.Stdin
 		}
 
+		f, err := spgz.OpenFile(*create, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0666)
+		if err != nil {
+			log.Fatalf("Could not open file: %v", err)
+		}
+
 		_, err = io.Copy(f, in)
 		if err != nil {
 			log.Fatalf("Copy failed: %v", err)
@@ -148,6 +152,17 @@ func main() {
 		if err != nil {
 			log.Fatalf("Close failed: %v", err)
 		}
-
+	} else if *size != "" {
+		f, err := spgz.OpenFile(*size, os.O_RDONLY, 0666)
+		if err != nil {
+			log.Fatalf("Could not open file: %v", err)
+		}
+		s, err := f.Size()
+		if err != nil {
+			log.Fatalf("Could not get file size: %v", err)
+		}
+		fmt.Printf("%d\n", s)
+	} else {
+		usage()
 	}
 }
