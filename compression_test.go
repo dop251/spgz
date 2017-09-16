@@ -215,6 +215,98 @@ func TestCompressedWrite1(t *testing.T) {
 	}
 }
 
+func TestCompressedTruncate(t *testing.T) {
+	var sf memSparseFile
+	f, err := NewFromSparseFile(&sf, os.O_RDWR|os.O_CREATE)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	buf := make([]byte, 1*1024*1024)
+
+	for i := 0; i < len(buf); i++ {
+		buf[i] = byte(rand.Int31n(256))
+	}
+
+	_, err = f.Write(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = f.Truncate(163999)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sz, err := f.Size()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sz != 163999 {
+		t.Fatalf("Unexpected size; %d", sz)
+	}
+
+	err = f.Truncate(63999)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sz, err = f.Size()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sz != 63999 {
+		t.Fatalf("Unexpected size; %d", sz)
+	}
+
+	err = f.Truncate(f.blockSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sz, err = f.Size()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sz != f.blockSize {
+		t.Fatalf("Unexpected size; %d", sz)
+	}
+
+}
+
+func TestPunchHole(t *testing.T) {
+	var sf memSparseFile
+	f, err := NewFromSparseFile(&sf, os.O_RDWR|os.O_CREATE)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	buf := make([]byte, 1*1024*1024)
+
+	for i := 0; i < len(buf); i++ {
+		buf[i] = byte(rand.Int31n(256))
+	}
+
+	_, err = f.Write(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = f.PunchHole(3333, 777777)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	buf = make([]byte, 777777)
+	_, err = f.ReadAt(buf, 3333)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !IsBlockZero(buf) {
+		t.Fatal("Block is not zero")
+	}
+}
+
 func zeroTest1(buf []byte) bool {
 	for _, b := range buf {
 		if b != 0 {
@@ -317,4 +409,7 @@ func TestIsBlockZero(t *testing.T) {
 		t.Fatal("block of 111 is zero (2)")
 	}
 
+	if !IsBlockZero(buf[:0]) {
+		t.Fatal("empty block is not zero")
+	}
 }

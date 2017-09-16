@@ -1,3 +1,5 @@
+// +build linux
+
 package spgz
 
 import (
@@ -75,5 +77,28 @@ func (w *SparseWriter) Write(p []byte) (int, error) {
 		return len(p), nil
 	} else {
 		return w.SparseFile.Write(p)
+	}
+}
+
+func (w *SparseWriter) WriteAt(p []byte, offset int64) (int, error) {
+	if IsBlockZero(p) {
+		err := w.PunchHole(offset, int64(len(p)))
+		if err != nil {
+			return 0, err
+		}
+		end, err := w.Seek(0, os.SEEK_END)
+		if err != nil {
+			return 0, err
+		}
+		offset += int64(len(p))
+		if end < offset {
+			err = w.Truncate(offset)
+		}
+		if err != nil {
+			return 0, err
+		}
+		return len(p), nil
+	} else {
+		return w.SparseFile.WriteAt(p, offset)
 	}
 }

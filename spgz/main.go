@@ -1,12 +1,16 @@
 package main
 
 import (
-	"github.com/dop251/spgz"
 	"flag"
 	"fmt"
 	"io"
-	"log"
 	"os"
+	"os/signal"
+
+	log "github.com/sirupsen/logrus"
+
+	"github.com/dop251/spgz"
+	"github.com/dop251/buse"
 )
 
 type fileType int
@@ -17,7 +21,10 @@ const (
 )
 
 func usage() {
-	fmt.Fprintf(os.Stderr, "Compress:\n    %[1]s -c <compressed_file> <source>\n\nExtract:\n    %[1]s -x <compressed_file> [--no-sparse] <target>\n\nGet original size:\n    %[1]s -s <compressed_file>\n", os.Args[0])
+	s := "Compress:\n    %[1]s -c <compressed_file> <source>\n\nExtract:\n    %[1]s -x <compressed_file> [--no-sparse] <target>\n\n"+
+		"Get original size:\n    %[1]s -s <compressed_file>\n\nConnect to a local nbd device:\n    %[1]s -b <compressed_file> /dev/nbd...\n"
+
+	fmt.Fprintf(os.Stderr, s, os.Args[0])
 	os.Exit(1)
 }
 
@@ -46,14 +53,21 @@ func failOptions() {
 }
 
 func main() {
+	var buse = flag.String("b", "", "Connect to a local nbd device")
 	var create = flag.String("c", "", "Create compressed file")
 	var extract = flag.String("x", "", "Extract compressed file")
 	var size = flag.String("s", "", "Get original size in bytes")
 	var noSparse = flag.Bool("no-sparse", false, "Disable sparse file")
+	var debug = flag.Bool("debug", false, "Enable debug logging")
+
 
 	flag.Parse()
 
 	name := flag.Arg(0)
+
+	if *debug {
+		log.SetLevel(log.DebugLevel)
+	}
 
 	if *extract != "" {
 		if *create != "" || *size != "" {
@@ -152,6 +166,8 @@ func main() {
 		if err != nil {
 			log.Fatalf("Close failed: %v", err)
 		}
+	} else if *buse != "" {
+		doBuse(*buse, name)
 	} else if *size != "" {
 		f, err := spgz.OpenFile(*size, os.O_RDONLY, 0666)
 		if err != nil {
@@ -165,4 +181,41 @@ func main() {
 	} else {
 		usage()
 	}
+}
+
+func doBuse(file, dev string) {
+	f, err := spgz.OpenFile(file, os.O_RDWR, 0666)
+	if err != nil {
+		log.Fatalf("Could not open file: %v", err)
+	}
+	size, err := f.Size()
+	if err != nil {
+		log.Fatalf("Could not get size: %v", err)
+	}
+	device, err := buse.NewDevice(dev, size, spgz.NewBuseDevice(f))
+	if err != nil {
+		log.Fatalf("Could not create a device: %v", err)
+	}
+
+	sig := make(chan os.Signal)
+	signal.Notify(sig, os.Interrupt)
+	disc := make(chan error, 1)
+	go func() {
+		disc <- device.Run()
+	}()
+	select {
+	case <-sig:
+		// Received SIGTERM, cleanup
+		log.Infoln("SIGINT, disconnecting...")
+		device.Disconnect()
+		err := <-disc
+		if err != nil {
+			log.Warnf("Disconnected, exiting. Err: %v\n", err)
+		} else {
+			log.Infoln("Disconnected, exiting")
+		}
+	case err := <-disc:
+		log.Warnf("Disconnected, err: %v\n", err)
+	}
+
 }

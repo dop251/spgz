@@ -7,6 +7,8 @@ import (
 	"errors"
 	"io"
 	"os"
+	"sync"
+	"log"
 )
 
 const (
@@ -39,6 +41,7 @@ type block struct {
 }
 
 type compFile struct {
+	sync.Mutex
 	f         SparseFile
 	blockSize int64
 	block     block
@@ -137,25 +140,16 @@ func (b *block) store(truncate bool) (err error) {
 
 	var curOffset int64
 
-	if IsBlockZero(b.data) {
+	if len(b.data) == 0 {
+		curOffset = headerSize + b.num*(b.f.blockSize+1)
+	} else if IsBlockZero(b.data) {
 		// log.Println("Block is all zeroes")
 		err = b.f.f.PunchHole(headerSize+b.num*(b.f.blockSize+1), int64(len(b.data))+1)
 		if err != nil {
 			err = ErrPunchHoleNotSupported
 			return err
 		}
-		var o int64
-		o, err = b.f.f.Seek(0, os.SEEK_END)
-		if err != nil {
-			return err
-		}
 		curOffset = headerSize + b.num*(b.f.blockSize+1) + int64(len(b.data)) + 1
-		if o < curOffset {
-			err = b.f.f.Truncate(curOffset) // Extend the file
-			if err != nil {
-				return err
-			}
-		}
 	} else {
 		b.prepareWrite()
 
@@ -184,11 +178,6 @@ func (b *block) store(truncate bool) (err error) {
 			}
 
 			curOffset = headerSize + b.num*(b.f.blockSize+1) + int64(n)
-			err = b.f.f.PunchHole(curOffset, b.f.blockSize-int64(n))
-			if err != nil {
-				err = ErrPunchHoleNotSupported
-			}
-
 		} else {
 			// log.Println("Storing uncompressed")
 			buf.Reset()
@@ -205,19 +194,31 @@ func (b *block) store(truncate bool) (err error) {
 
 	b.dirty = false
 
-	var o int64
-	o, err = b.f.f.Seek(0, os.SEEK_END)
-	if err != nil {
-		return err
-	}
-
-	// log.Printf("curOffset: %d, size: %d\n", curOffset, o)
-
-	if truncate || o < headerSize+(b.num+1)*(b.f.blockSize+1) {
-		if o > curOffset {
+	if truncate {
+		err = b.f.f.Truncate(curOffset)
+	} else {
+		var o int64
+		o, err = b.f.f.Seek(0, os.SEEK_END)
+		if err != nil {
+			return err
+		}
+		if o < curOffset {
 			err = b.f.f.Truncate(curOffset)
+		} else if o > curOffset {
+			endOfBlock := headerSize+(b.num+1)*(b.f.blockSize+1)
+			if o < endOfBlock {
+				err = b.f.f.Truncate(curOffset)
+			}
+			if holesize := endOfBlock - curOffset; holesize > 0 {
+				err = b.f.f.PunchHole(curOffset, endOfBlock - curOffset)
+				if err != nil {
+					log.Printf("offset: %d, length: %d", curOffset, endOfBlock - curOffset)
+					err = ErrPunchHoleNotSupported
+				}
+			}
 		}
 	}
+
 	return
 }
 
@@ -236,8 +237,10 @@ func (b *block) prepareWrite() {
 
 func (f *compFile) Read(buf []byte) (n int, err error) {
 	// log.Printf("Read %d bytes at %d\n", len(buf), f.offset)
-	err = f.load()
+	f.Lock()
+	err = f.loadAt(f.offset)
 	if err != nil {
+		f.Unlock()
 		return 0, err
 	}
 	o := f.offset - f.block.num*f.blockSize
@@ -246,11 +249,29 @@ func (f *compFile) Read(buf []byte) (n int, err error) {
 	if n == 0 {
 		err = io.EOF
 	}
+	f.Unlock()
 	return
 }
 
-func (f *compFile) load() error {
-	num := f.offset / f.blockSize
+func (f *compFile) ReadAt(buf []byte, offset int64) (n int, err error) {
+	f.Lock()
+	for n < len(buf) {
+		err = f.loadAt(offset)
+		if err != nil {
+			f.Unlock()
+			return
+		}
+		o := offset - f.block.num*f.blockSize
+		n1 := copy(buf[n:], f.block.data[o:])
+		n += n1
+		offset += int64(n1)
+	}
+	f.Unlock()
+	return
+}
+
+func (f *compFile) loadAt(offset int64) error {
+	num := offset / f.blockSize
 	if num != f.block.num || !f.loaded {
 		if f.block.dirty {
 			err := f.block.store(false)
@@ -265,18 +286,18 @@ func (f *compFile) load() error {
 	return nil
 }
 
-func (f *compFile) Write(buf []byte) (n int, err error) {
+func (f *compFile) write(buf[] byte, offset int64) (n int, err error) {
 	for len(buf) > 0 {
 		// log.Printf("Writing %d bytes\n", len(buf))
-		err = f.load()
+		err = f.loadAt(offset)
 		if err != nil {
 			if err != io.EOF {
-				return 0, err
+				return
 			}
 			err = nil
 		}
 
-		o := f.offset - f.block.num*f.blockSize
+		o := offset - f.block.num*f.blockSize
 		newBlockSize := o + int64(len(buf))
 		if newBlockSize > f.blockSize {
 			newBlockSize = f.blockSize
@@ -291,10 +312,90 @@ func (f *compFile) Write(buf []byte) (n int, err error) {
 		nn := copy(f.block.data[o:], buf)
 		f.block.dirty = true
 		n += nn
-		f.offset += int64(nn)
+		offset += int64(nn)
 		buf = buf[nn:]
 	}
+
 	return
+}
+
+func (f *compFile) Write(buf []byte) (n int, err error) {
+	f.Lock()
+	n, err = f.write(buf, f.offset)
+	f.offset += int64(n)
+	f.Unlock()
+	return
+}
+
+func (f *compFile) WriteAt(buf []byte, offset int64) (n int, err error) {
+	f.Lock()
+	n, err = f.write(buf, offset)
+	f.Unlock()
+	return
+}
+
+func (f *compFile) PunchHole(offset, size int64) error {
+	num := offset / f.blockSize
+	l := offset - num * f.blockSize
+	blocks := size / f.blockSize
+	f.Lock()
+	defer f.Unlock()
+	if l > 0 {
+		err := f.loadAt(offset)
+		if err != nil {
+			if err == io.EOF {
+				err = nil
+			}
+			return err
+		}
+		if int64(len(f.block.data)) <= l {
+			return nil
+		}
+		tail := f.block.data[l:]
+		for i := range tail {
+			tail[i] = 0
+		}
+		f.block.dirty = true
+		l = int64(len(f.block.data)) - l
+		offset += l
+		size -= l
+		num++
+	} else {
+		if f.loaded && f.block.num >= num && f.block.num < num + blocks {
+			// The currently loaded block falls in the hole, discard it
+			f.loaded = false
+		}
+	}
+
+	if blocks > 0 {
+		err := f.f.PunchHole(headerSize+(num)*(f.blockSize+1), blocks*(f.blockSize+1))
+		if err != nil {
+			return err
+		}
+		l = blocks * f.blockSize
+		offset += l
+		size -= l
+	}
+	if size > 0 {
+		err := f.loadAt(offset)
+		if err != nil {
+			if err == io.EOF {
+				err = nil
+			}
+			return err
+		}
+		l := int(size)
+		if l > len(f.block.data) {
+			l = len(f.block.data)
+		}
+		head := f.block.data[:l]
+		for i := range head {
+			head[i] = 0
+		}
+		f.block.dirty = true
+	}
+
+	return nil
 }
 
 func (f *compFile) Size() (int64, error) {
@@ -306,8 +407,9 @@ func (f *compFile) Size() (int64, error) {
 		return 0, nil
 	}
 	lastBlockNum := (o - headerSize) / (f.blockSize + 1)
-	if f.loaded && lastBlockNum <= f.block.num {
-		// Last block is currently loaded
+	f.Lock()
+	defer f.Unlock()
+	if f.loaded && f.block.num >= lastBlockNum {
 		return f.block.num*f.blockSize + int64(len(f.block.data)), nil
 	}
 
@@ -317,7 +419,7 @@ func (f *compFile) Size() (int64, error) {
 
 	err = b.load(lastBlockNum)
 
-	if err != nil {
+	if err != nil && err != io.EOF {
 		return 0, err
 	}
 	return lastBlockNum*f.blockSize + int64(len(b.data)), nil
@@ -344,32 +446,44 @@ func (f *compFile) Seek(offset int64, whence int) (int64, error) {
 
 func (f *compFile) Truncate(size int64) error {
 	blockNum := size / f.blockSize
-	b := &block{
-		f: f,
-	}
-
-	err := b.load(blockNum)
-	if err != nil {
-		if err == io.EOF {
-			err = nil
-		} else {
-			return err
+	var b *block
+	f.Lock()
+	if f.loaded && f.block.num == blockNum {
+		b = &f.block
+	} else {
+		b = &block{
+			f: f,
+		}
+		err := b.load(blockNum)
+		if err != nil {
+			if err == io.EOF {
+				err = nil
+			} else {
+				f.Unlock()
+				return err
+			}
 		}
 	}
 
 	newLen := int(size - blockNum*f.blockSize)
 
-	if len(b.data) != newLen {
-		b.data = b.data[:newLen]
-		err = b.store(true)
+	b.data = b.data[:newLen]
+	err := b.store(true)
+
+	if f.loaded && f.block.num > blockNum {
+		f.loaded = false
 	}
 
+	f.Unlock()
 	return err
 }
 
 func (f *compFile) WriteTo(w io.Writer) (n int64, err error) {
+	f.Lock()
+	defer f.Unlock()
+
 	for {
-		err = f.load()
+		err = f.loadAt(f.offset)
 		if err != nil {
 			if err == io.EOF {
 				err = nil
@@ -391,8 +505,11 @@ func (f *compFile) WriteTo(w io.Writer) (n int64, err error) {
 }
 
 func (f *compFile) ReadFrom(rd io.Reader) (n int64, err error) {
+	f.Lock()
+	defer f.Unlock()
+
 	for {
-		err = f.load()
+		err = f.loadAt(f.offset)
 		if err != nil {
 			if err != io.EOF {
 				return
@@ -419,6 +536,9 @@ func (f *compFile) ReadFrom(rd io.Reader) (n int64, err error) {
 }
 
 func (f *compFile) Sync() error {
+	f.Lock()
+	defer f.Unlock()
+
 	if f.block.dirty {
 		err := f.block.store(false)
 		if err != nil {
@@ -429,6 +549,9 @@ func (f *compFile) Sync() error {
 }
 
 func (f *compFile) Close() error {
+	f.Lock()
+	defer f.Unlock()
+
 	if f.block.dirty {
 		err := f.block.store(false)
 		if err != nil {
