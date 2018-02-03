@@ -78,6 +78,7 @@ func (b *block) load(num int64) error {
 			} else {
 				b.data = b.dataBlock[:0]
 				b.blockIsRaw = false
+				b.dirty = false
 				return err
 			}
 		} else {
@@ -520,8 +521,15 @@ func (f *compFile) ReadFrom(rd io.Reader) (n int64, err error) {
 		var r int
 		r, err = rd.Read(buf)
 		nl := o + r
-		if nl > len(f.block.data) {
+		l := len(f.block.data)
+		if nl > l {
 			f.block.data = f.block.data[:nl]
+		}
+		if l < o {
+			a := f.block.data[l:o]
+			for i := range a {
+				a[i] = 0
+			}
 		}
 		f.offset += int64(r)
 		n += int64(r)

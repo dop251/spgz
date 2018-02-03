@@ -307,6 +307,72 @@ func TestPunchHole(t *testing.T) {
 	}
 }
 
+func TestReadFromDirtyBuffer(t *testing.T) {
+	var sf memSparseFile
+	f, err := NewFromSparseFileSize(&sf, os.O_RDWR|os.O_CREATE, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	buf := make([]byte, 4096)
+	for i := range buf {
+		buf[i] = 'x'
+	}
+
+	_, err = f.Write(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = f.Seek(5000, os.SEEK_SET)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rd := bytes.NewBuffer(buf)
+	_, err = f.ReadFrom(rd)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f.Close()
+	_, err = sf.Seek(0, os.SEEK_SET)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f1, err := NewFromSparseFile(&sf, os.O_RDONLY)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	buf1 := make([]byte, 9096)
+
+	_, err = io.ReadFull(f1, buf1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 4096; i++ {
+		if buf1[i] != 'x' {
+			t.Fatalf("Invalid byte at %d: %d", i, buf1[i])
+		}
+	}
+
+	for i := 4096; i < 5000; i++ {
+		if buf1[i] != 0 {
+			t.Fatalf("Invalid byte at %d: %d", i, buf1[i])
+		}
+	}
+
+	for i := 5000; i < 9096; i++ {
+		if buf1[i] != 'x' {
+			t.Fatalf("Invalid byte at %d: %d", i, buf1[i])
+		}
+	}
+
+}
+
 func zeroTest1(buf []byte) bool {
 	for _, b := range buf {
 		if b != 0 {
