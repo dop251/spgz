@@ -127,7 +127,7 @@ func main() {
 			if *noSparse || ftype != _FTYPE_FILE {
 				w = out
 			} else {
-				w = spgz.NewSparseWriter(spgz.NewSparseFile(out))
+				w = spgz.NewSparseWriter(spgz.NewSparseFileWithFallback(out))
 			}
 		}
 

@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"sync"
-	"log"
 )
 
 const (
@@ -27,7 +26,6 @@ const (
 
 var (
 	ErrInvalidFormat         = errors.New("Invalid file format")
-	ErrPunchHoleNotSupported = errors.New("The filesystem does not support punching holes. Use xfs or ext4")
 	ErrFileIsDirectory       = errors.New("File cannot be a directory")
 )
 
@@ -147,7 +145,6 @@ func (b *block) store(truncate bool) (err error) {
 		// log.Println("Block is all zeroes")
 		err = b.f.f.PunchHole(headerSize+b.num*(b.f.blockSize+1), int64(len(b.data))+1)
 		if err != nil {
-			err = ErrPunchHoleNotSupported
 			return err
 		}
 		curOffset = headerSize + b.num*(b.f.blockSize+1) + int64(len(b.data)) + 1
@@ -212,10 +209,6 @@ func (b *block) store(truncate bool) (err error) {
 			}
 			if holesize := endOfBlock - curOffset; holesize > 0 {
 				err = b.f.f.PunchHole(curOffset, endOfBlock - curOffset)
-				if err != nil {
-					log.Printf("offset: %d, length: %d", curOffset, endOfBlock - curOffset)
-					err = ErrPunchHoleNotSupported
-				}
 			}
 		}
 	}
@@ -570,6 +563,22 @@ func (f *compFile) Close() error {
 }
 
 func (f *compFile) init(flag int, blockSize int64) error {
+	if flag&os.O_WRONLY != 0 || flag&os.O_RDWR != 0 {
+		// Check if punching holes is supported
+		off, err := f.f.Seek(0, os.SEEK_END)
+		if err != nil {
+			return err
+		}
+
+		if err := f.f.PunchHole(off, 4096); err != nil {
+			return err
+		}
+
+		if _, err := f.f.Seek(0, os.SEEK_SET); err != nil {
+			return err
+		}
+	}
+
 	blockSize &= 0xffffffffffff000
 	if blockSize == 0 {
 		blockSize = defBlockSize
