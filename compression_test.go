@@ -353,23 +353,11 @@ func TestReadFromDirtyBuffer(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 4096; i++ {
-		if buf1[i] != 'x' {
-			t.Fatalf("Invalid byte at %d: %d", i, buf1[i])
-		}
-	}
+	expectRange(buf1, 0, 4096, 'x', t)
 
-	for i := 4096; i < 5000; i++ {
-		if buf1[i] != 0 {
-			t.Fatalf("Invalid byte at %d: %d", i, buf1[i])
-		}
-	}
+	expectRange(buf1, 4096, 5000 - 4096, 0, t)
 
-	for i := 5000; i < 9096; i++ {
-		if buf1[i] != 'x' {
-			t.Fatalf("Invalid byte at %d: %d", i, buf1[i])
-		}
-	}
+	expectRange(buf1, 5000, 4096, 'x', t)
 
 }
 

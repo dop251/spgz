@@ -5,6 +5,10 @@ import (
 	"os"
 )
 
+const (
+	BUFSIZE = 32768
+)
+
 type Truncatable interface {
 	Truncate(size int64) error
 }
@@ -94,7 +98,22 @@ func (f *SparseFileWithFallback) PunchHole(offset, size int64) error {
 			}
 		}
 	}
-	buf := make([]byte, size)
-	_, err := f.WriteAt(buf, offset)
-	return err
+
+	var buf [BUFSIZE]byte
+	for size > 0 {
+		var s int64
+		if size > BUFSIZE {
+			s = BUFSIZE
+		} else {
+			s = size
+		}
+		_, err := f.WriteAt(buf[:s], offset)
+		if err != nil {
+			return err
+		}
+		offset += s
+		size -= s
+	}
+
+	return nil
 }
