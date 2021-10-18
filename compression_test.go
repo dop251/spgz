@@ -283,13 +283,31 @@ func TestPunchHole(t *testing.T) {
 
 	buf := make([]byte, 1*1024*1024)
 
-	for i := 0; i < len(buf); i++ {
-		buf[i] = byte(rand.Int31n(256))
-	}
+	rand.Read(buf)
 
 	_, err = f.Write(buf)
 	if err != nil {
 		t.Fatal(err)
+	}
+
+	err = f.PunchHole(100, 200)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	buf1 := append([]byte(nil), buf...)
+	for i := 100; i < 300; i++ {
+		buf1[i] = 0
+	}
+
+	_, _ = f.Seek(0, io.SeekStart)
+	buf2, err := io.ReadAll(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !bytes.Equal(buf2, buf1) {
+		t.Fatal("not equal")
 	}
 
 	err = f.PunchHole(3333, 777777)
@@ -297,13 +315,18 @@ func TestPunchHole(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	buf = make([]byte, 777777)
-	_, err = f.ReadAt(buf, 3333)
+	for i := 3333; i < 3333+777777; i++ {
+		buf1[i] = 0
+	}
+
+	_, _ = f.Seek(0, io.SeekStart)
+	buf2, err = io.ReadAll(f)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !IsBlockZero(buf) {
-		t.Fatal("Block is not zero")
+
+	if !bytes.Equal(buf2, buf1) {
+		t.Fatal("not equal")
 	}
 }
 

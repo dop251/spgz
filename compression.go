@@ -331,7 +331,6 @@ func (f *compFile) WriteAt(buf []byte, offset int64) (n int, err error) {
 func (f *compFile) PunchHole(offset, size int64) error {
 	num := offset / f.blockSize
 	l := offset - num*f.blockSize
-	blocks := size / f.blockSize
 	f.Lock()
 	defer f.Unlock()
 	if l > 0 {
@@ -346,25 +345,29 @@ func (f *compFile) PunchHole(offset, size int64) error {
 			return nil
 		}
 		tail := f.block.data[l:]
+		if int64(len(tail)) > size {
+			tail = tail[:size]
+		}
 		for i := range tail {
 			tail[i] = 0
 		}
 		f.block.dirty = true
-		l = int64(len(f.block.data)) - l
+		l = int64(len(tail))
 		offset += l
 		size -= l
 		num++
-	} else {
-		if f.loaded && f.block.num >= num && f.block.num < num+blocks {
-			// The currently loaded block falls in the hole, discard it
-			f.loaded = false
-		}
 	}
+
+	blocks := size / f.blockSize
 
 	if blocks > 0 {
 		err := f.f.PunchHole(headerSize+(num)*(f.blockSize+1), blocks*(f.blockSize+1))
 		if err != nil {
 			return err
+		}
+		if f.loaded && f.block.num >= num && f.block.num < num+blocks {
+			// The currently loaded block falls in the hole, discard it
+			f.loaded = false
 		}
 		l = blocks * f.blockSize
 		offset += l
