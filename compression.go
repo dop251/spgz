@@ -16,7 +16,7 @@ const (
 )
 
 const (
-	defBlockSize = 128 * 1024 - 1
+	defBlockSize = 128*1024 - 1
 )
 
 const (
@@ -25,8 +25,8 @@ const (
 )
 
 var (
-	ErrInvalidFormat         = errors.New("Invalid file format")
-	ErrFileIsDirectory       = errors.New("File cannot be a directory")
+	ErrInvalidFormat   = errors.New("Invalid file format")
+	ErrFileIsDirectory = errors.New("File cannot be a directory")
 )
 
 type block struct {
@@ -203,12 +203,12 @@ func (b *block) store(truncate bool) (err error) {
 		if o < curOffset {
 			err = b.f.f.Truncate(curOffset)
 		} else if o > curOffset {
-			endOfBlock := headerSize+(b.num+1)*(b.f.blockSize+1)
+			endOfBlock := headerSize + (b.num+1)*(b.f.blockSize+1)
 			if o < endOfBlock {
 				err = b.f.f.Truncate(curOffset)
 			}
 			if holesize := endOfBlock - curOffset; holesize > 0 {
-				err = b.f.f.PunchHole(curOffset, endOfBlock - curOffset)
+				err = b.f.f.PunchHole(curOffset, endOfBlock-curOffset)
 			}
 		}
 	}
@@ -280,7 +280,7 @@ func (f *compFile) loadAt(offset int64) error {
 	return nil
 }
 
-func (f *compFile) write(buf[] byte, offset int64) (n int, err error) {
+func (f *compFile) write(buf []byte, offset int64) (n int, err error) {
 	for len(buf) > 0 {
 		// log.Printf("Writing %d bytes\n", len(buf))
 		err = f.loadAt(offset)
@@ -330,7 +330,7 @@ func (f *compFile) WriteAt(buf []byte, offset int64) (n int, err error) {
 
 func (f *compFile) PunchHole(offset, size int64) error {
 	num := offset / f.blockSize
-	l := offset - num * f.blockSize
+	l := offset - num*f.blockSize
 	blocks := size / f.blockSize
 	f.Lock()
 	defer f.Unlock()
@@ -355,7 +355,7 @@ func (f *compFile) PunchHole(offset, size int64) error {
 		size -= l
 		num++
 	} else {
-		if f.loaded && f.block.num >= num && f.block.num < num + blocks {
+		if f.loaded && f.block.num >= num && f.block.num < num+blocks {
 			// The currently loaded block falls in the hole, discard it
 			f.loaded = false
 		}
@@ -397,8 +397,8 @@ func (f *compFile) Size() (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if o <= headerSize {
-		return 0, nil
+	if o < headerSize {
+		o = headerSize
 	}
 	lastBlockNum := (o - headerSize) / (f.blockSize + 1)
 	f.Lock()

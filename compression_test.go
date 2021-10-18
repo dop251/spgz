@@ -355,10 +355,42 @@ func TestReadFromDirtyBuffer(t *testing.T) {
 
 	expectRange(buf1, 0, 4096, 'x', t)
 
-	expectRange(buf1, 4096, 5000 - 4096, 0, t)
+	expectRange(buf1, 4096, 5000-4096, 0, t)
 
 	expectRange(buf1, 5000, 4096, 'x', t)
 
+}
+
+func TestSize(t *testing.T) {
+	var sf memSparseFile
+
+	f, err := NewFromSparseFile(&sf, os.O_RDWR|os.O_CREATE)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := f.Size()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s != 0 {
+		t.Fatal(s)
+	}
+
+	buf := make([]byte, 4096)
+	rand.Read(buf)
+	_, err = f.Write(buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	s, err = f.Size()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s != int64(len(buf)) {
+		t.Fatal(s)
+	}
 }
 
 func zeroTest1(buf []byte) bool {
