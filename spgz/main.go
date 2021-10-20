@@ -5,23 +5,22 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/signal"
-
-	log "github.com/sirupsen/logrus"
 
 	"github.com/dop251/spgz"
-	"github.com/dop251/buse"
+
+	log "github.com/sirupsen/logrus"
 )
 
 type fileType int
+
 const (
-	_FTYPE_FILE    fileType = iota
-	_FTYPE_BLKDEV
-	_FTYPE_STREAM
+	fileTypeRegular fileType = iota
+	fileTypeBlockDev
+	fileTypeStream
 )
 
 func usage() {
-	s := "Compress:\n    %[1]s -c <compressed_file> <source>\n\nExtract:\n    %[1]s -x <compressed_file> [--no-sparse] <target>\n\n"+
+	s := "Compress:\n    %[1]s -c <compressed_file> <source>\n\nExtract:\n    %[1]s -x <compressed_file> [--no-sparse] <target>\n\n" +
 		"Get original size:\n    %[1]s -s <compressed_file>\n\nConnect to a local nbd device:\n    %[1]s -b <compressed_file> /dev/nbd...\n"
 
 	fmt.Fprintf(os.Stderr, s, os.Args[0])
@@ -31,20 +30,20 @@ func usage() {
 func getFileType(f *os.File) (fileType, error) {
 	info, err := f.Stat()
 	if err != nil {
-		return _FTYPE_FILE, err
+		return fileTypeRegular, err
 	}
 
 	mode := info.Mode()
 	if !mode.IsRegular() {
-		if mode & (os.ModeCharDevice | os.ModeNamedPipe | os.ModeSocket) != 0 {
-			return _FTYPE_STREAM, nil
+		if mode&(os.ModeCharDevice|os.ModeNamedPipe|os.ModeSocket) != 0 {
+			return fileTypeStream, nil
 		}
-		if mode & os.ModeDevice != 0 {
-			return _FTYPE_BLKDEV, nil
+		if mode&os.ModeDevice != 0 {
+			return fileTypeBlockDev, nil
 		}
 	}
 
-	return _FTYPE_FILE, nil
+	return fileTypeRegular, nil
 }
 
 func failOptions() {
@@ -53,13 +52,12 @@ func failOptions() {
 }
 
 func main() {
-	var buse = flag.String("b", "", "Connect to a local nbd device")
+	var buse = getBuseFlag()
 	var create = flag.String("c", "", "Create compressed file")
 	var extract = flag.String("x", "", "Extract compressed file")
 	var size = flag.String("s", "", "Get original size in bytes")
 	var noSparse = flag.Bool("no-sparse", false, "Disable sparse file")
 	var debug = flag.Bool("debug", false, "Enable debug logging")
-
 
 	flag.Parse()
 
@@ -100,8 +98,8 @@ func main() {
 		}
 
 		var w io.WriteCloser
-		if ftype == _FTYPE_BLKDEV {
-			size, err := out.Seek(0, os.SEEK_END)
+		if ftype == fileTypeBlockDev {
+			size, err := out.Seek(0, io.SeekEnd)
 			if err != nil {
 				log.Fatalf("Could not determine target device size: %v", err)
 			}
@@ -112,19 +110,19 @@ func main() {
 			if size != srcSize {
 				log.Fatalf("Target device size (%d) does not match source size (%d)", size, srcSize)
 			}
-			_, err = out.Seek(0, os.SEEK_SET)
+			_, err = out.Seek(0, io.SeekStart)
 			if err != nil {
 				log.Fatalf("Seek failed: %v", err)
 			}
 			w = out
 		} else {
-			if ftype == _FTYPE_FILE {
+			if ftype == fileTypeRegular {
 				err = out.Truncate(0)
 				if err != nil {
 					log.Printf("Truncate() failed: %v", err)
 				}
 			}
-			if *noSparse || ftype != _FTYPE_FILE {
+			if *noSparse || ftype != fileTypeRegular {
 				w = out
 			} else {
 				w = spgz.NewSparseWriter(spgz.NewSparseFileWithFallback(out))
@@ -181,41 +179,4 @@ func main() {
 	} else {
 		usage()
 	}
-}
-
-func doBuse(file, dev string) {
-	f, err := spgz.OpenFile(file, os.O_RDWR, 0666)
-	if err != nil {
-		log.Fatalf("Could not open file: %v", err)
-	}
-	size, err := f.Size()
-	if err != nil {
-		log.Fatalf("Could not get size: %v", err)
-	}
-	device, err := buse.NewDevice(dev, size, spgz.NewBuseDevice(f))
-	if err != nil {
-		log.Fatalf("Could not create a device: %v", err)
-	}
-
-	sig := make(chan os.Signal)
-	signal.Notify(sig, os.Interrupt)
-	disc := make(chan error, 1)
-	go func() {
-		disc <- device.Run()
-	}()
-	select {
-	case <-sig:
-		// Received SIGTERM, cleanup
-		log.Infoln("SIGINT, disconnecting...")
-		device.Disconnect()
-		err := <-disc
-		if err != nil {
-			log.Warnf("Disconnected, exiting. Err: %v\n", err)
-		} else {
-			log.Infoln("Disconnected, exiting")
-		}
-	case err := <-disc:
-		log.Warnf("Disconnected, err: %v\n", err)
-	}
-
 }

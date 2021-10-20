@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"sync"
@@ -16,7 +17,7 @@ const (
 )
 
 const (
-	defBlockSize = 128*1024 - 1
+	DefBlockSize = 128*1024 - 1
 )
 
 const (
@@ -25,12 +26,41 @@ const (
 )
 
 var (
-	ErrInvalidFormat   = errors.New("Invalid file format")
-	ErrFileIsDirectory = errors.New("File cannot be a directory")
+	ErrInvalidFormat         = errors.New("invalid file format")
+	ErrFileIsDirectory       = errors.New("file cannot be a directory")
+	ErrWriteOnlyNotSupported = errors.New("write only mode is not supported")
 )
 
+// ErrCorruptCompressedBlock is returned when a compressed block involved in a read or a write operation is
+// corrupt (for example as a result of a partial write). Note, this is not a media error.
+//
+// Any read operation intersecting with the range specified by Offset() and Size(() will fail.
+// Any write operation intersecting, but not fully covering the range, will also fail (therefore in order to make
+// the file usable again one must overwrite the entire range in a single write operation).
+type ErrCorruptCompressedBlock struct {
+	offset, size int64
+
+	err error
+}
+
+func (e *ErrCorruptCompressedBlock) Error() string {
+	return fmt.Sprintf("corrupted compressed block at %d, size %d: %v", e.offset, e.size, e.err)
+}
+
+func (e *ErrCorruptCompressedBlock) Unwrap() error {
+	return e.err
+}
+
+func (e *ErrCorruptCompressedBlock) Offset() int64 {
+	return e.offset
+}
+
+func (e *ErrCorruptCompressedBlock) Size() int64 {
+	return e.size
+}
+
 type block struct {
-	f                   *compFile
+	f                   *SpgzFile
 	num                 int64
 	data                []byte
 	rawBlock, dataBlock []byte
@@ -38,24 +68,24 @@ type block struct {
 	dirty               bool
 }
 
-type compFile struct {
+type SpgzFile struct {
 	sync.Mutex
 	f         SparseFile
 	blockSize int64
-	block     block
-	loaded    bool
+	readOnly  bool
 
+	block  block
+	loaded bool
 	offset int64
 }
 
-func (b *block) init(f *compFile) {
+func (b *block) init(f *SpgzFile) {
 	b.f = f
 	b.dirty = false
 	b.blockIsRaw = false
 }
 
 func (b *block) load(num int64) error {
-	// log.Printf("Loading block %d", num)
 	b.num = num
 	if b.rawBlock == nil {
 		b.rawBlock = make([]byte, b.f.blockSize+1)
@@ -93,17 +123,28 @@ func (b *block) load(num int64) error {
 	case blkCompressed:
 		err = b.loadCompressed()
 	}
-	b.dirty = false
-	// log.Printf("Loaded, size %d\n", len(b.data))
-	return err
 
+	b.dirty = false
+
+	return err
+}
+
+func (b *block) createCorruptBlockError(err error) *ErrCorruptCompressedBlock {
+	var size int64
+	if int64(len(b.rawBlock)) == b.f.blockSize+1 {
+		size = b.f.blockSize
+	}
+	return &ErrCorruptCompressedBlock{
+		offset: b.num * b.f.blockSize,
+		size:   size,
+		err:    err,
+	}
 }
 
 func (b *block) loadCompressed() error {
-	// log.Println("Block is compressed")
 	z, err := gzip.NewReader(bytes.NewBuffer(b.rawBlock[1:]))
 	if err != nil {
-		return err
+		return b.createCorruptBlockError(err)
 	}
 	z.Multistream(false)
 
@@ -111,7 +152,7 @@ func (b *block) loadCompressed() error {
 
 	_, err = io.Copy(buf, z)
 	if err != nil {
-		return err
+		return b.createCorruptBlockError(err)
 	}
 	b.data = buf.Bytes()
 	b.blockIsRaw = false
@@ -135,14 +176,11 @@ func (b *block) loadCompressed() error {
 }
 
 func (b *block) store(truncate bool) (err error) {
-	// log.Printf("Storing block %d", b.num)
-
 	var curOffset int64
 
 	if len(b.data) == 0 {
 		curOffset = headerSize + b.num*(b.f.blockSize+1)
 	} else if IsBlockZero(b.data) {
-		// log.Println("Block is all zeroes")
 		err = b.f.f.PunchHole(headerSize+b.num*(b.f.blockSize+1), int64(len(b.data))+1)
 		if err != nil {
 			return err
@@ -169,7 +207,6 @@ func (b *block) store(truncate bool) (err error) {
 		bb := buf.Bytes()
 		n := len(bb)
 		if n+1 < len(b.data)-2*4096 { // save at least 2 blocks
-			// log.Printf("Storing compressed, size %d\n", n - 1)
 			_, err = b.f.f.WriteAt(bb, headerSize+b.num*(b.f.blockSize+1))
 			if err != nil {
 				return err
@@ -177,7 +214,6 @@ func (b *block) store(truncate bool) (err error) {
 
 			curOffset = headerSize + b.num*(b.f.blockSize+1) + int64(n)
 		} else {
-			// log.Println("Storing uncompressed")
 			buf.Reset()
 			buf.WriteByte(blkUncompressed)
 			buf.Write(b.data)
@@ -195,20 +231,13 @@ func (b *block) store(truncate bool) (err error) {
 	if truncate {
 		err = b.f.f.Truncate(curOffset)
 	} else {
-		var o int64
-		o, err = b.f.f.Seek(0, os.SEEK_END)
-		if err != nil {
-			return err
-		}
-		if o < curOffset {
+		if int64(len(b.data)) < b.f.blockSize {
+			// last block
 			err = b.f.f.Truncate(curOffset)
-		} else if o > curOffset {
+		} else {
 			endOfBlock := headerSize + (b.num+1)*(b.f.blockSize+1)
-			if o < endOfBlock {
-				err = b.f.f.Truncate(curOffset)
-			}
-			if holesize := endOfBlock - curOffset; holesize > 0 {
-				err = b.f.f.PunchHole(curOffset, endOfBlock-curOffset)
+			if holeSize := endOfBlock - curOffset; holeSize > 0 {
+				err = b.f.f.PunchHole(curOffset, holeSize)
 			}
 		}
 	}
@@ -229,8 +258,13 @@ func (b *block) prepareWrite() {
 	}
 }
 
-func (f *compFile) Read(buf []byte) (n int, err error) {
-	// log.Printf("Read %d bytes at %d\n", len(buf), f.offset)
+// BlockSize returns the block size for optimal I/O. Reads and writes should be multiples of the block size and
+// should be aligned with block boundaries.
+func (f *SpgzFile) BlockSize() int64 {
+	return f.blockSize
+}
+
+func (f *SpgzFile) Read(buf []byte) (n int, err error) {
 	f.Lock()
 	err = f.loadAt(f.offset)
 	if err != nil {
@@ -247,7 +281,7 @@ func (f *compFile) Read(buf []byte) (n int, err error) {
 	return
 }
 
-func (f *compFile) ReadAt(buf []byte, offset int64) (n int, err error) {
+func (f *SpgzFile) ReadAt(buf []byte, offset int64) (n int, err error) {
 	f.Lock()
 	for n < len(buf) {
 		err = f.loadAt(offset)
@@ -264,7 +298,7 @@ func (f *compFile) ReadAt(buf []byte, offset int64) (n int, err error) {
 	return
 }
 
-func (f *compFile) loadAt(offset int64) error {
+func (f *SpgzFile) loadAt(offset int64) error {
 	num := offset / f.blockSize
 	if num != f.block.num || !f.loaded {
 		if f.block.dirty {
@@ -274,24 +308,45 @@ func (f *compFile) loadAt(offset int64) error {
 			}
 		}
 		err := f.block.load(num)
-		f.loaded = true
+		f.loaded = err == nil || err == io.EOF
 		return err
 	}
 	return nil
 }
 
-func (f *compFile) write(buf []byte, offset int64) (n int, err error) {
+func (f *SpgzFile) write(buf []byte, offset int64) (n int, err error) {
+	if f.readOnly {
+		return 0, os.ErrPermission
+	}
 	for len(buf) > 0 {
-		// log.Printf("Writing %d bytes\n", len(buf))
-		err = f.loadAt(offset)
-		if err != nil {
-			if err != io.EOF {
-				return
+		num := offset / f.blockSize
+		o := offset - num*f.blockSize
+		if num != f.block.num || !f.loaded {
+			if f.block.dirty {
+				err = f.block.store(false)
+				if err != nil {
+					return
+				}
 			}
-			err = nil
+			if o == 0 && int64(len(buf)) >= f.blockSize {
+				// The block is overwritten completely, there is no need to load it first
+				f.block.num = num
+				if f.block.dataBlock == nil {
+					f.block.dataBlock = make([]byte, f.blockSize)
+				}
+				f.block.data = f.block.dataBlock[:0]
+			} else {
+				err = f.block.load(num)
+				if err != nil {
+					if err != io.EOF {
+						return
+					}
+					err = nil
+				}
+			}
+			f.loaded = true
 		}
 
-		o := offset - f.block.num*f.blockSize
 		newBlockSize := o + int64(len(buf))
 		if newBlockSize > f.blockSize {
 			newBlockSize = f.blockSize
@@ -313,7 +368,7 @@ func (f *compFile) write(buf []byte, offset int64) (n int, err error) {
 	return
 }
 
-func (f *compFile) Write(buf []byte) (n int, err error) {
+func (f *SpgzFile) Write(buf []byte) (n int, err error) {
 	f.Lock()
 	n, err = f.write(buf, f.offset)
 	f.offset += int64(n)
@@ -321,14 +376,14 @@ func (f *compFile) Write(buf []byte) (n int, err error) {
 	return
 }
 
-func (f *compFile) WriteAt(buf []byte, offset int64) (n int, err error) {
+func (f *SpgzFile) WriteAt(buf []byte, offset int64) (n int, err error) {
 	f.Lock()
 	n, err = f.write(buf, offset)
 	f.Unlock()
 	return
 }
 
-func (f *compFile) PunchHole(offset, size int64) error {
+func (f *SpgzFile) PunchHole(offset, size int64) error {
 	num := offset / f.blockSize
 	l := offset - num*f.blockSize
 	f.Lock()
@@ -361,7 +416,7 @@ func (f *compFile) PunchHole(offset, size int64) error {
 	blocks := size / f.blockSize
 
 	if blocks > 0 {
-		err := f.f.PunchHole(headerSize+(num)*(f.blockSize+1), blocks*(f.blockSize+1))
+		err := f.f.PunchHole(headerSize+num*(f.blockSize+1), blocks*(f.blockSize+1))
 		if err != nil {
 			return err
 		}
@@ -395,8 +450,8 @@ func (f *compFile) PunchHole(offset, size int64) error {
 	return nil
 }
 
-func (f *compFile) Size() (int64, error) {
-	o, err := f.f.Seek(0, os.SEEK_END)
+func (f *SpgzFile) Size() (int64, error) {
+	o, err := f.f.Seek(0, io.SeekEnd)
 	if err != nil {
 		return 0, err
 	}
@@ -422,15 +477,15 @@ func (f *compFile) Size() (int64, error) {
 	return lastBlockNum*f.blockSize + int64(len(b.data)), nil
 }
 
-func (f *compFile) Seek(offset int64, whence int) (int64, error) {
+func (f *SpgzFile) Seek(offset int64, whence int) (int64, error) {
 	switch whence {
-	case os.SEEK_SET:
+	case io.SeekStart:
 		f.offset = offset
 		return f.offset, nil
-	case os.SEEK_CUR:
+	case io.SeekCurrent:
 		f.offset += offset
 		return f.offset, nil
-	case os.SEEK_END:
+	case io.SeekEnd:
 		size, err := f.Size()
 		if err != nil {
 			return f.offset, err
@@ -441,7 +496,7 @@ func (f *compFile) Seek(offset int64, whence int) (int64, error) {
 	return f.offset, os.ErrInvalid
 }
 
-func (f *compFile) Truncate(size int64) error {
+func (f *SpgzFile) Truncate(size int64) error {
 	blockNum := size / f.blockSize
 	var b *block
 	f.Lock()
@@ -456,8 +511,13 @@ func (f *compFile) Truncate(size int64) error {
 			if err == io.EOF {
 				err = nil
 			} else {
-				f.Unlock()
-				return err
+				var ce *ErrCorruptCompressedBlock
+				if errors.As(err, &ce) {
+					err = nil
+				} else {
+					f.Unlock()
+					return err
+				}
 			}
 		}
 	}
@@ -475,7 +535,7 @@ func (f *compFile) Truncate(size int64) error {
 	return err
 }
 
-func (f *compFile) WriteTo(w io.Writer) (n int64, err error) {
+func (f *SpgzFile) WriteTo(w io.Writer) (n int64, err error) {
 	f.Lock()
 	defer f.Unlock()
 
@@ -501,7 +561,10 @@ func (f *compFile) WriteTo(w io.Writer) (n int64, err error) {
 	}
 }
 
-func (f *compFile) ReadFrom(rd io.Reader) (n int64, err error) {
+func (f *SpgzFile) ReadFrom(rd io.Reader) (n int64, err error) {
+	if f.readOnly {
+		return 0, os.ErrPermission
+	}
 	f.Lock()
 	defer f.Unlock()
 
@@ -539,7 +602,7 @@ func (f *compFile) ReadFrom(rd io.Reader) (n int64, err error) {
 	}
 }
 
-func (f *compFile) Sync() error {
+func (f *SpgzFile) Sync() error {
 	f.Lock()
 	defer f.Unlock()
 
@@ -552,7 +615,7 @@ func (f *compFile) Sync() error {
 	return f.f.Sync()
 }
 
-func (f *compFile) Close() error {
+func (f *SpgzFile) Close() error {
 	f.Lock()
 	defer f.Unlock()
 
@@ -565,78 +628,96 @@ func (f *compFile) Close() error {
 	return f.f.Close()
 }
 
-func (f *compFile) init(flag int, blockSize int64) error {
-	if flag&os.O_WRONLY != 0 || flag&os.O_RDWR != 0 {
-		// Check if punching holes is supported
-		off, err := f.f.Seek(0, os.SEEK_END)
-		if err != nil {
-			return err
-		}
-
-		if err := f.f.PunchHole(off, 4096); err != nil {
-			return err
-		}
-
-		if _, err := f.f.Seek(0, os.SEEK_SET); err != nil {
-			return err
-		}
+func (f *SpgzFile) checkPunchHole() error {
+	// Check if punching holes is supported
+	off, err := f.f.Seek(0, io.SeekEnd)
+	if err != nil {
+		return err
 	}
 
-	blockSize &= 0xffffffffffff000
-	if blockSize == 0 {
-		blockSize = defBlockSize
-	} else {
-		blockSize--
+	if err := f.f.PunchHole(off, 4096); err != nil {
+		return err
 	}
 
-	f.block.init(f)
+	_, err = f.f.Seek(0, io.SeekStart)
+	return err
+}
 
+func (f *SpgzFile) init(flag int, blockSize int64) error {
+	if flag&os.O_WRONLY != 0 {
+		return ErrWriteOnlyNotSupported
+	}
+	f.readOnly = flag&os.O_RDWR == 0
 	// Trying to read the header
 	buf := make([]byte, len(headerMagic)+4)
-
 	_, err := io.ReadFull(f.f, buf)
 	if err != nil {
 		if err == io.EOF {
 			// Empty file
-			if flag&os.O_WRONLY != 0 || flag&os.O_RDWR != 0 {
-				w := bytes.NewBuffer(buf[:0])
-				w.WriteString(headerMagic)
-				binary.Write(w, binary.LittleEndian, uint32((blockSize+1)/4096))
-				_, err = f.f.Write(w.Bytes())
+			if flag&os.O_RDWR != 0 && flag&os.O_CREATE != 0 {
+				err = f.checkPunchHole()
 				if err != nil {
 					return err
 				}
-				f.blockSize = blockSize
-				return nil
+				if blockSize == 0 {
+					blockSize = DefBlockSize
+				} else {
+					blockSize = (blockSize &^ 0xFFF) - 1
+					if blockSize < 0xFFF {
+						blockSize = 0xFFF
+					}
+				}
+				copy(buf, headerMagic)
+				binary.LittleEndian.PutUint32(buf[len(headerMagic):], uint32((blockSize+1)/4096))
+				_, err = f.f.Write(buf)
+				if err != nil {
+					return err
+				}
+			} else {
+				return ErrInvalidFormat
 			}
 		}
 		if err == io.ErrUnexpectedEOF {
 			return ErrInvalidFormat
 		}
-		return err
+		if err != nil {
+			return err
+		}
+	} else {
+		if string(buf[:len(headerMagic)]) != headerMagic {
+			return ErrInvalidFormat
+		}
+		if !f.readOnly {
+			err = f.checkPunchHole()
+			if err != nil {
+				return err
+			}
+		}
+		bs := binary.LittleEndian.Uint32(buf[8:])
+		blockSize = int64(bs*4096) - 1
 	}
-	if string(buf[:8]) != headerMagic {
-		return ErrInvalidFormat
-	}
-	w := bytes.NewBuffer(buf[8:])
-	var bs uint32
-	binary.Read(w, binary.LittleEndian, &bs)
-	f.blockSize = int64(bs*4096) - 1
+	f.blockSize = blockSize
+	f.block.init(f)
 	return nil
 }
 
-func OpenFile(name string, flag int, perm os.FileMode) (f *compFile, err error) {
+// OpenFile opens a file as SpgzFile with block size of DefBlockSize. See OpenFileSize for more details.
+func OpenFile(name string, flag int, perm os.FileMode) (f *SpgzFile, err error) {
 	return OpenFileSize(name, flag, perm, 0)
 }
 
-func OpenFileSize(name string, flag int, perm os.FileMode, blockSize int64) (f *compFile, err error) {
+// OpenFileSize opens a file as SpgzFile. See NewFromFileSize for more details.
+func OpenFileSize(name string, flag int, perm os.FileMode, blockSize int64) (f *SpgzFile, err error) {
 	var ff *os.File
+	if flag&os.O_WRONLY != 0 {
+		return nil, ErrWriteOnlyNotSupported
+	}
 	ff, err = os.OpenFile(name, flag, perm)
 	if err != nil {
 		return nil, err
 	}
 
-	f = &compFile{
+	f = &SpgzFile{
 		f: NewSparseFile(ff),
 	}
 
@@ -649,11 +730,28 @@ func OpenFileSize(name string, flag int, perm os.FileMode, blockSize int64) (f *
 	return f, nil
 }
 
-func NewFromFile(file *os.File, flag int) (f *compFile, err error) {
+// NewFromFile creates a new SpgzFile from the given *os.File with desired block size of DefBlockSize.
+// See NewFromFileSize for more details.
+func NewFromFile(file *os.File, flag int) (f *SpgzFile, err error) {
 	return NewFromFileSize(file, flag, 0)
 }
 
-func NewFromFileSize(file *os.File, flag int, blockSize int64) (f *compFile, err error) {
+// NewFromFileSize creates a new SpgzFile from the given *os.File. File position must be 0.
+//
+// The blockSize parameter specifies the desired block size for newly created files. The actual block size will be
+// DefBlockSize if the supplied value is 0, otherwise (blockSize &^ 0xFFF) - 1 or 0xFFF whichever is greater. For
+// optimal I/O performance reads and writes should be sized in multiples of the actual block size and aligned at the
+// block size boundaries. This can be achieved by using bufio.Reader and bufio.Writer.
+// This parameter is ignored for already initialised files. The current block size can be retrieved using
+// SpgzFile.BlockSize().
+//
+// The flag parameter is similar to that of os.OpenFile().
+// If the file is empty it will be initialised if os.O_CREATE and os.O_RDWR are set, otherwise
+// ErrInvalidFormat is returned. Write-only mode (os.O_WRONLY) is not supported.
+//
+// Returns ErrPunchHoleNotSupported if opening for writing and the underlying OS or filesystem does not support
+// punching holes (as space-saving will not be possible in this case).
+func NewFromFileSize(file *os.File, flag int, blockSize int64) (f *SpgzFile, err error) {
 	info, err := file.Stat()
 	if err != nil {
 		return nil, err
@@ -662,24 +760,15 @@ func NewFromFileSize(file *os.File, flag int, blockSize int64) (f *compFile, err
 		return nil, ErrFileIsDirectory
 	}
 
-	f = &compFile{
-		f: NewSparseFile(file),
-	}
-
-	err = f.init(flag, blockSize)
-	if err != nil {
-		return nil, err
-	}
-
-	return f, nil
+	return NewFromSparseFileSize(NewSparseFile(file), flag, blockSize)
 }
 
-func NewFromSparseFile(file SparseFile, flag int) (f *compFile, err error) {
+func NewFromSparseFile(file SparseFile, flag int) (f *SpgzFile, err error) {
 	return NewFromSparseFileSize(file, flag, 0)
 }
 
-func NewFromSparseFileSize(file SparseFile, flag int, blockSize int64) (f *compFile, err error) {
-	f = &compFile{
+func NewFromSparseFileSize(file SparseFile, flag int, blockSize int64) (f *SpgzFile, err error) {
+	f = &SpgzFile{
 		f: file,
 	}
 

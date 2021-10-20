@@ -1,12 +1,13 @@
+//go:build linux
 // +build linux
 
 package spgz
 
 type BuseDevice struct {
-	*compFile
+	*SpgzFile
 }
 
-func NewBuseDevice(f *compFile) *BuseDevice {
+func NewBuseDevice(f *SpgzFile) *BuseDevice {
 	return &BuseDevice{f}
 }
 

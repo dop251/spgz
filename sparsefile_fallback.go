@@ -1,13 +1,14 @@
+//go:build !linux
 // +build !linux
 
 package spgz
 
 import (
-	"os"
 	"errors"
+	"os"
 )
 
-var ErrPunchHoleNotSupported = errors.New("Punching holes is not supported on this platform")
+var ErrPunchHoleNotSupported = errors.New("punching holes is not supported on this platform")
 
 type sparseFile struct {
 	*os.File

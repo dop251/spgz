@@ -33,9 +33,19 @@ type SparseFileWithFallback struct {
 	fallback bool
 }
 
+// NewSparseFileWithFallback creates a sparse file that will fall back to writing zeros if the first call to
+// SparseFile.PunchHole() returns ErrPunchHoleNotSupported.
 func NewSparseFileWithFallback(f *os.File) *SparseFileWithFallback {
 	return &SparseFileWithFallback{
 		SparseFile: NewSparseFile(f),
+	}
+}
+
+// NewSparseFileWithoutHolePunching creates a sparse file that will write zeros instead of calling SparseFile.PunchHole()
+func NewSparseFileWithoutHolePunching(f *os.File) *SparseFileWithFallback {
+	return &SparseFileWithFallback{
+		SparseFile: NewSparseFile(f),
+		fallback:   true,
 	}
 }
 
@@ -47,17 +57,17 @@ func NewSparseWriter(f SparseFile) *SparseWriter {
 
 func (w *SparseWriter) Write(p []byte) (int, error) {
 	if IsBlockZero(p) {
-		offset, err := w.SparseFile.Seek(0, os.SEEK_CUR)
+		offset, err := w.SparseFile.Seek(0, io.SeekCurrent)
 		if err != nil {
 			return 0, err
 		}
-		end, err := w.Seek(0, os.SEEK_END)
+		end, err := w.Seek(0, io.SeekEnd)
 		if err != nil {
 			return 0, err
 		}
 		l := int64(len(p))
 		if offset < end {
-			if offset + l < end {
+			if offset+l < end {
 				err = w.PunchHole(offset, int64(len(p)))
 				if err != nil {
 					return 0, err
@@ -71,7 +81,7 @@ func (w *SparseWriter) Write(p []byte) (int, error) {
 			}
 		}
 		offset += l
-		_, err = w.Seek(offset, os.SEEK_SET)
+		_, err = w.Seek(offset, io.SeekStart)
 		if err != nil {
 			return 0, err
 		}
@@ -96,6 +106,8 @@ func (f *SparseFileWithFallback) PunchHole(offset, size int64) error {
 			} else {
 				return err
 			}
+		} else {
+			return nil
 		}
 	}
 

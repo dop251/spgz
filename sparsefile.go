@@ -1,11 +1,12 @@
+//go:build linux
 // +build linux
 
 package spgz
 
 import (
+	"errors"
 	"os"
 	"syscall"
-	"errors"
 )
 
 const (
@@ -14,7 +15,7 @@ const (
 )
 
 var (
-	ErrPunchHoleNotSupported = errors.New("This filesystem does not support punching holes. Use xfs, ext4, btrfs or such")
+	ErrPunchHoleNotSupported = errors.New("this filesystem does not support punching holes. Use xfs, ext4, btrfs or such")
 )
 
 type sparseFile struct {
@@ -36,4 +37,3 @@ func (f *sparseFile) PunchHole(offset, size int64) error {
 
 	return err
 }
-
