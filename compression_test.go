@@ -274,6 +274,111 @@ func TestCompressedTruncate(t *testing.T) {
 
 }
 
+func TestTruncateExpandWithDirtyLastBlock(t *testing.T) {
+	var sf memSparseFile
+
+	f, err := NewFromSparseFileSize(&sf, os.O_RDWR|os.O_CREATE, MinBlockSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	block := make([]byte, MinBlockSize+1000)
+	rand.Read(block)
+
+	_, err = f.Write(block)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = f.Truncate(MinBlockSize*2 + 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = f.Seek(0, io.SeekStart)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = f.Read(block[:MinBlockSize]) // flush the 2nd block
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	size, err := f.Size()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if size != MinBlockSize*2+1000 {
+		t.Fatalf("size: %d", size)
+	}
+}
+
+func TestTruncateExpandWithinBlock(t *testing.T) {
+	var sf memSparseFile
+
+	f, err := NewFromSparseFileSize(&sf, os.O_RDWR|os.O_CREATE, MinBlockSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	block := make([]byte, MinBlockSize+1000)
+	rand.Read(block)
+
+	_, err = f.Write(block)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = f.Truncate(MinBlockSize + 2000)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	buf := make([]byte, 1000)
+	_, err = f.ReadAt(buf, MinBlockSize+1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !IsBlockZero(buf) {
+		t.Fatal("not zero")
+	}
+}
+
+func TestTruncateExactlyAtBlockBoundary(t *testing.T) {
+	var sf memSparseFile
+
+	f, err := NewFromSparseFileSize(&sf, os.O_RDWR|os.O_CREATE, MinBlockSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	block := make([]byte, MinBlockSize*2+1000)
+	rand.Read(block)
+
+	_, err = f.Write(block)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = f.ReadAt(block[:MinBlockSize], 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = f.Truncate(MinBlockSize * 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	size, err := f.Size()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if size != MinBlockSize*2 {
+		t.Fatal(size)
+	}
+}
+
 func TestPunchHole(t *testing.T) {
 	var sf memSparseFile
 	f, err := NewFromSparseFile(&sf, os.O_RDWR|os.O_CREATE)
@@ -332,12 +437,12 @@ func TestPunchHole(t *testing.T) {
 
 func TestReadFromDirtyBuffer(t *testing.T) {
 	var sf memSparseFile
-	f, err := NewFromSparseFileSize(&sf, os.O_RDWR|os.O_CREATE, 4096)
+	f, err := NewFromSparseFileSize(&sf, os.O_RDWR|os.O_CREATE, MinBlockSize)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	buf := make([]byte, 4096)
+	buf := make([]byte, MinBlockSize+1)
 	for i := range buf {
 		buf[i] = 'x'
 	}
@@ -347,7 +452,7 @@ func TestReadFromDirtyBuffer(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = f.Seek(5000, io.SeekStart)
+	_, err = f.Seek(MinBlockSize+1001, io.SeekStart)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -369,30 +474,37 @@ func TestReadFromDirtyBuffer(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	buf1 := make([]byte, 9096)
+	s, err := f1.Size()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if s != 2*(MinBlockSize+1)+1000 {
+		t.Fatal(s)
+	}
+	buf1 := make([]byte, s)
 
 	_, err = io.ReadFull(f1, buf1)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	expectRange(buf1, 0, 4096, 'x', t)
+	expectRange(buf1, 0, len(buf), 'x', t)
 
-	expectRange(buf1, 4096, 5000-4096, 0, t)
+	expectRange(buf1, len(buf), 1000, 0, t)
 
-	expectRange(buf1, 5000, 4096, 'x', t)
+	expectRange(buf1, len(buf)+1000, len(buf), 'x', t)
 
 }
 
 func TestCorruptedCompression(t *testing.T) {
-	const blockSize = 3*4096 - 1 // to make sure it's compressed
 	var sf memSparseFile
 
-	f, err := NewFromSparseFileSize(&sf, os.O_RDWR|os.O_CREATE, blockSize+1)
+	f, err := NewFromSparseFileSize(&sf, os.O_RDWR|os.O_CREATE, MinBlockSize)
 	if err != nil {
 		t.Fatal(err)
 	}
-	buf := make([]byte, blockSize)
+	buf := make([]byte, MinBlockSize)
 	for i := range buf {
 		buf[i] = 'x'
 	}
@@ -400,7 +512,7 @@ func TestCorruptedCompression(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = f.WriteAt(buf, blockSize)
+	_, err = f.WriteAt(buf, MinBlockSize)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -412,7 +524,7 @@ func TestCorruptedCompression(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rbuf := make([]byte, blockSize)
+	rbuf := make([]byte, MinBlockSize)
 	n, err := f.ReadAt(rbuf, 0)
 	if err == nil {
 		t.Fatal("err is nil")
@@ -425,7 +537,7 @@ func TestCorruptedCompression(t *testing.T) {
 		if o := ce.Offset(); o != 0 {
 			t.Fatalf("offset: %d", o)
 		}
-		if s := ce.Size(); s != blockSize {
+		if s := ce.Size(); s != MinBlockSize {
 			t.Fatalf("size: %d", s)
 		}
 	} else {
@@ -446,14 +558,13 @@ func TestCorruptedCompression(t *testing.T) {
 }
 
 func TestCorruptedCompressionHeader(t *testing.T) {
-	const blockSize = 3*4096 - 1 // to make sure it's compressed
 	var sf memSparseFile
 
-	f, err := NewFromSparseFileSize(&sf, os.O_RDWR|os.O_CREATE, blockSize+1)
+	f, err := NewFromSparseFileSize(&sf, os.O_RDWR|os.O_CREATE, MinBlockSize)
 	if err != nil {
 		t.Fatal(err)
 	}
-	buf := make([]byte, blockSize)
+	buf := make([]byte, MinBlockSize)
 	for i := range buf {
 		buf[i] = 'x'
 	}
@@ -461,7 +572,7 @@ func TestCorruptedCompressionHeader(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = f.WriteAt(buf, blockSize)
+	_, err = f.WriteAt(buf, MinBlockSize)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -473,7 +584,7 @@ func TestCorruptedCompressionHeader(t *testing.T) {
 	// corrupting the first block gzip header
 	sf.data[4098] = ^sf.data[4098]
 
-	rbuf := make([]byte, blockSize)
+	rbuf := make([]byte, MinBlockSize)
 	n, err := f.ReadAt(rbuf, 0)
 	if err == nil {
 		t.Fatal("err is nil")
@@ -486,7 +597,7 @@ func TestCorruptedCompressionHeader(t *testing.T) {
 		if o := ce.Offset(); o != 0 {
 			t.Fatalf("offset: %d", o)
 		}
-		if s := ce.Size(); s != blockSize {
+		if s := ce.Size(); s != MinBlockSize {
 			t.Fatalf("size: %d", s)
 		}
 	} else {
@@ -495,14 +606,13 @@ func TestCorruptedCompressionHeader(t *testing.T) {
 }
 
 func TestCorruptedLastBlock(t *testing.T) {
-	const blockSize = 3*4096 - 1 // to make sure it's compressed
 	var sf memSparseFile
 
-	f, err := NewFromSparseFileSize(&sf, os.O_RDWR|os.O_CREATE, blockSize+1)
+	f, err := NewFromSparseFileSize(&sf, os.O_RDWR|os.O_CREATE, MinBlockSize)
 	if err != nil {
 		t.Fatal(err)
 	}
-	buf := make([]byte, blockSize)
+	buf := make([]byte, MinBlockSize)
 	for i := range buf {
 		buf[i] = 'x'
 	}
@@ -510,7 +620,7 @@ func TestCorruptedLastBlock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = f.WriteAt(buf[:blockSize-200], blockSize)
+	_, err = f.WriteAt(buf[:MinBlockSize-200], MinBlockSize)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -521,14 +631,14 @@ func TestCorruptedLastBlock(t *testing.T) {
 
 	// corrupting the last block
 	zeroBuf := make([]byte, 1000)
-	_, err = sf.WriteAt(zeroBuf, headerSize+blockSize+16)
+	_, err = sf.WriteAt(zeroBuf, headerSize+MinBlockSize+16)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	_, _ = sf.Seek(0, io.SeekStart)
 
-	f, err = NewFromSparseFileSize(&sf, os.O_RDWR, blockSize+1)
+	f, err = NewFromSparseFileSize(&sf, os.O_RDWR, MinBlockSize)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -539,7 +649,7 @@ func TestCorruptedLastBlock(t *testing.T) {
 	}
 
 	// Truncating to fix the error
-	err = f.Truncate(blockSize)
+	err = f.Truncate(MinBlockSize)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -552,17 +662,21 @@ func TestCorruptedLastBlock(t *testing.T) {
 
 }
 
-func testShrinkLastBlock(t *testing.T, blockSize, lastBlockSize int64) {
+func testShrinkLastBlock(t *testing.T, lastBlockSize int64, compressed bool) {
 	var sf memSparseFile
 
-	f, err := NewFromSparseFileSize(&sf, os.O_RDWR|os.O_CREATE, blockSize)
+	f, err := NewFromSparseFileSize(&sf, os.O_RDWR|os.O_CREATE, MinBlockSize)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	buf := make([]byte, blockSize-1)
-	for i := range buf {
-		buf[i] = 'x'
+	buf := make([]byte, MinBlockSize)
+	if compressed {
+		for i := range buf {
+			buf[i] = 'x'
+		}
+	} else {
+		rand.Read(buf)
 	}
 	_, err = f.Write(buf)
 	if err != nil {
@@ -583,7 +697,7 @@ func testShrinkLastBlock(t *testing.T, blockSize, lastBlockSize int64) {
 		t.Fatal(err)
 	}
 
-	f, err = NewFromSparseFileSize(&sf, os.O_RDWR, blockSize)
+	f, err = NewFromSparseFileSize(&sf, os.O_RDWR, MinBlockSize)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -591,12 +705,12 @@ func testShrinkLastBlock(t *testing.T, blockSize, lastBlockSize int64) {
 	if s, err := f.Size(); err != nil {
 		t.Fatal(err)
 	} else {
-		if s != blockSize-1+lastBlockSize {
+		if s != MinBlockSize+lastBlockSize {
 			t.Fatalf("size: %d", s)
 		}
 	}
 
-	_, err = f.WriteAt(buf[:lastBlockSize/2], blockSize-1)
+	_, err = f.WriteAt(buf[:lastBlockSize/2], MinBlockSize)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -611,7 +725,7 @@ func testShrinkLastBlock(t *testing.T, blockSize, lastBlockSize int64) {
 		t.Fatal(err)
 	}
 
-	f, err = NewFromSparseFileSize(&sf, os.O_RDWR, blockSize)
+	f, err = NewFromSparseFileSize(&sf, os.O_RDWR, MinBlockSize)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -619,12 +733,12 @@ func testShrinkLastBlock(t *testing.T, blockSize, lastBlockSize int64) {
 	if s, err := f.Size(); err != nil {
 		t.Fatal(err)
 	} else {
-		if s != blockSize-1+lastBlockSize {
+		if s != MinBlockSize+lastBlockSize {
 			t.Fatalf("size: %d", s)
 		}
 	}
 
-	err = f.Truncate(blockSize - 1)
+	err = f.Truncate(MinBlockSize)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -632,7 +746,7 @@ func testShrinkLastBlock(t *testing.T, blockSize, lastBlockSize int64) {
 	if s, err := f.Size(); err != nil {
 		t.Fatal(err)
 	} else {
-		if s != blockSize-1 {
+		if s != MinBlockSize {
 			t.Fatalf("size: %d", s)
 		}
 	}
@@ -640,19 +754,19 @@ func testShrinkLastBlock(t *testing.T, blockSize, lastBlockSize int64) {
 
 func TestShrinkLastBlock(t *testing.T) {
 	t.Run("uncompressed_short", func(t *testing.T) {
-		testShrinkLastBlock(t, 4096, 1000)
+		testShrinkLastBlock(t, 1000, false)
 	})
 
 	t.Run("compressed_short", func(t *testing.T) {
-		testShrinkLastBlock(t, 3*4096, 1000)
+		testShrinkLastBlock(t, 1000, true)
 	})
 
 	t.Run("uncompressed_full", func(t *testing.T) {
-		testShrinkLastBlock(t, 4096, 4095)
+		testShrinkLastBlock(t, MinBlockSize, false)
 	})
 
 	t.Run("compressed_full", func(t *testing.T) {
-		testShrinkLastBlock(t, 3*4096, 3*4096-1)
+		testShrinkLastBlock(t, MinBlockSize, true)
 	})
 }
 

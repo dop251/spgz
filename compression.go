@@ -18,6 +18,7 @@ const (
 
 const (
 	DefBlockSize = 128*1024 - 1
+	MinBlockSize = 3*4096 - 1
 )
 
 const (
@@ -159,7 +160,7 @@ func (b *block) loadCompressed() error {
 
 	l := int64(len(b.data))
 	if l < b.f.blockSize {
-		o, err := b.f.f.Seek(0, os.SEEK_END)
+		o, err := b.f.f.Seek(0, io.SeekEnd)
 		if err != nil {
 			return err
 		}
@@ -301,7 +302,7 @@ func (f *SpgzFile) ReadAt(buf []byte, offset int64) (n int, err error) {
 func (f *SpgzFile) loadAt(offset int64) error {
 	num := offset / f.blockSize
 	if num != f.block.num || !f.loaded {
-		if f.block.dirty {
+		if f.loaded && f.block.dirty {
 			err := f.block.store(false)
 			if err != nil {
 				return err
@@ -322,7 +323,7 @@ func (f *SpgzFile) write(buf []byte, offset int64) (n int, err error) {
 		num := offset / f.blockSize
 		o := offset - num*f.blockSize
 		if num != f.block.num || !f.loaded {
-			if f.block.dirty {
+			if f.loaded && f.block.dirty {
 				err = f.block.store(false)
 				if err != nil {
 					return
@@ -498,41 +499,78 @@ func (f *SpgzFile) Seek(offset int64, whence int) (int64, error) {
 
 func (f *SpgzFile) Truncate(size int64) error {
 	blockNum := size / f.blockSize
+	newLen := int(size - blockNum*f.blockSize)
 	var b *block
+
 	f.Lock()
+	defer f.Unlock()
+
 	if f.loaded && f.block.num == blockNum {
 		b = &f.block
 	} else {
-		b = &block{
-			f: f,
+		if f.loaded && f.block.num < blockNum && int64(len(f.block.data)) < f.blockSize {
+			// The last block which is loaded is no longer last, expand it with zeros
+			tail := f.block.data[len(f.block.data):f.blockSize]
+			for i := range tail {
+				tail[i] = 0
+			}
+			f.block.data = f.block.data[:f.blockSize]
+			f.block.dirty = true
 		}
-		err := b.load(blockNum)
-		if err != nil {
-			if err == io.EOF {
-				err = nil
-			} else {
-				var ce *ErrCorruptCompressedBlock
-				if errors.As(err, &ce) {
-					err = nil
+		if newLen != 0 {
+			b = &block{
+				f: f,
+			}
+			err := b.load(blockNum)
+			if err != nil {
+				if err == io.EOF {
+					b = nil
 				} else {
-					f.Unlock()
 					return err
 				}
 			}
 		}
+		if b == nil {
+			// Truncating beyond the current EOF (i.e. expanding)
+			if newLen > 0 {
+				// Add one byte (which will be zero) to indicate an uncompressed block
+				newLen++
+			}
+			err := f.f.Truncate(headerSize + blockNum*(f.blockSize+1) + int64(newLen))
+			if err != nil {
+				return err
+			}
+			if f.loaded && f.block.num > blockNum {
+				f.loaded = false
+			}
+			return nil
+		}
 	}
 
-	newLen := int(size - blockNum*f.blockSize)
-
-	b.data = b.data[:newLen]
-	err := b.store(true)
+	if b == &f.block {
+		if newLen != len(b.data) {
+			if newLen > len(b.data) {
+				tail := b.data[len(b.data):newLen]
+				for i := range tail {
+					tail[i] = 0
+				}
+			}
+			b.data = b.data[:newLen]
+			b.dirty = true
+		}
+	} else {
+		b.data = b.data[:newLen]
+		err := b.store(true)
+		if err != nil {
+			return err
+		}
+	}
 
 	if f.loaded && f.block.num > blockNum {
 		f.loaded = false
 	}
 
-	f.Unlock()
-	return err
+	return nil
 }
 
 func (f *SpgzFile) WriteTo(w io.Writer) (n int64, err error) {
@@ -662,9 +700,9 @@ func (f *SpgzFile) init(flag int, blockSize int64) error {
 				if blockSize == 0 {
 					blockSize = DefBlockSize
 				} else {
-					blockSize = (blockSize &^ 0xFFF) - 1
-					if blockSize < 0xFFF {
-						blockSize = 0xFFF
+					blockSize = ((blockSize + 1) &^ 0xFFF) - 1
+					if blockSize < MinBlockSize {
+						blockSize = MinBlockSize
 					}
 				}
 				copy(buf, headerMagic)
@@ -739,7 +777,7 @@ func NewFromFile(file *os.File, flag int) (f *SpgzFile, err error) {
 // NewFromFileSize creates a new SpgzFile from the given *os.File. File position must be 0.
 //
 // The blockSize parameter specifies the desired block size for newly created files. The actual block size will be
-// DefBlockSize if the supplied value is 0, otherwise (blockSize &^ 0xFFF) - 1 or 0xFFF whichever is greater. For
+// DefBlockSize if the supplied value is 0, otherwise ((blockSize+1) &^ 0xFFF)-1 or MinBlockSize whichever is greater. For
 // optimal I/O performance reads and writes should be sized in multiples of the actual block size and aligned at the
 // block size boundaries. This can be achieved by using bufio.Reader and bufio.Writer.
 // This parameter is ignored for already initialised files. The current block size can be retrieved using
