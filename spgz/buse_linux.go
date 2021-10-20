@@ -25,7 +25,7 @@ func checkDev(dev string) error {
 			cmd := exec.Command("modprobe", "nbd")
 			err = cmd.Run()
 			if err != nil {
-				return fmt.Errorf("%q does not exist and 'modprobe nbd' has failed: %w", err)
+				return fmt.Errorf("%q does not exist and 'modprobe nbd' has failed: %w", dev, err)
 			}
 		} else {
 			return err
