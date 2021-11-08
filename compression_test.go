@@ -4,409 +4,325 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"io/ioutil"
 	"math/rand"
 	"os"
+	"runtime/debug"
 	"testing"
 )
 
-type memSparseFile struct {
-	data   []byte
-	offset int64
-}
-
-func (s *memSparseFile) Read(buf []byte) (n int, err error) {
-	if s.offset >= int64(len(s.data)) {
-		err = io.EOF
-		return
-	}
-	n = copy(buf, s.data[s.offset:])
-	s.offset += int64(n)
-	return
-}
-
-func (s *memSparseFile) ensureSize(newSize int64) {
-	if newSize > int64(len(s.data)) {
-		if newSize <= int64(cap(s.data)) {
-			l := int64(len(s.data))
-			s.data = s.data[:newSize]
-			for i := l; i < s.offset; i++ {
-				s.data[i] = 0
-			}
-		} else {
-			d := make([]byte, newSize)
-			copy(d, s.data)
-			s.data = d
-		}
-	}
-}
-
-func (s *memSparseFile) Write(buf []byte) (n int, err error) {
-	s.ensureSize(s.offset + int64(len(buf)))
-	n = copy(s.data[s.offset:], buf)
-	if n < len(buf) {
-		err = io.ErrShortWrite
-	}
-	s.offset += int64(n)
-	return
-}
-
-func (s *memSparseFile) Seek(offset int64, whence int) (int64, error) {
-	switch whence {
-	case io.SeekStart:
-		s.offset = offset
-		return s.offset, nil
-	case io.SeekCurrent:
-		s.offset += offset
-		return s.offset, nil
-	case io.SeekEnd:
-		s.offset = int64(len(s.data)) + offset
-		return s.offset, nil
-	}
-	return s.offset, errors.New("invalid whence")
-}
-
-func (s *memSparseFile) Truncate(size int64) error {
-	if size > int64(len(s.data)) {
-		if size <= int64(cap(s.data)) {
-			l := len(s.data)
-			s.data = s.data[:size]
-			for i := l; i < len(s.data); i++ {
-				s.data[i] = 0
-			}
-		} else {
-			d := make([]byte, size)
-			copy(d, s.data)
-			s.data = d
-		}
-	} else if size < int64(len(s.data)) {
-		s.data = s.data[:size]
-	}
-	return nil
-}
-
-func (s *memSparseFile) PunchHole(offset, size int64) error {
-	if offset < int64(len(s.data)) {
-		d := offset + size - int64(len(s.data))
-		if d > 0 {
-			size -= d
-		}
-		for i := offset; i < offset+size; i++ {
-			s.data[i] = 0
-		}
-	}
-	return nil
-}
-
-func (s *memSparseFile) ReadAt(p []byte, off int64) (n int, err error) {
-	if off < int64(len(s.data)) {
-		n = copy(p, s.data[off:])
-	}
-	if n < len(p) {
-		err = io.EOF
-	}
-	return
-}
-
-func (s *memSparseFile) WriteAt(p []byte, off int64) (n int, err error) {
-	s.ensureSize(off + int64(len(p)))
-	n = copy(s.data[off:], p)
-	return
-}
-
-func (s *memSparseFile) Close() error {
-	return nil
-}
-
-func (s *memSparseFile) Sync() error {
-	return nil
-}
-
-func (s *memSparseFile) Bytes() []byte {
-	return s.data
-}
-
 func TestCompressedWrite(t *testing.T) {
-	var sf memSparseFile
+	ct := &cmpTest{t: t}
 
-	f, err := NewFromSparseFile(&sf, os.O_RDWR|os.O_CREATE)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	err = f.Truncate(0)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ct.open(0, false)
+	ct.truncate(0)
 
 	buf := make([]byte, 1*1024*1024)
-	_, err = f.Write(buf)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ct.write(buf)
 
 	for i := 0; i < len(buf); i++ {
 		buf[i] = byte(i)
 	}
-	_, err = f.Write(buf)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ct.write(buf)
 
-	o, err := f.Seek(0, io.SeekEnd)
-	if err != nil {
-		t.Fatal(err)
-	}
-
+	o := ct.seek(0, io.SeekEnd)
 	if o != 2*1024*1024 {
 		t.Fatalf("Unexpected size: %d", o)
 	}
 
-	err = f.Close()
-	if err != nil {
-		t.Fatal(err)
-	}
-
+	ct.check()
 }
 
 func TestCompressedWrite1(t *testing.T) {
-	var sf memSparseFile
-	f, err := NewFromSparseFile(&sf, os.O_RDWR|os.O_CREATE)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ct := &cmpTest{t: t}
 
-	err = f.Truncate(0)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ct.open(0, false)
+	ct.truncate(0)
 
 	buf := make([]byte, 2*1024*1024)
+	rand.Read(buf)
+	ct.write(buf)
+	ct.reopen(true)
+	ct.check()
+}
 
-	for i := 0; i < len(buf); i++ {
-		buf[i] = byte(rand.Int31n(256))
-	}
+func TestCompressedOverwriteShrink(t *testing.T) {
+	ct := &cmpTest{t: t}
 
-	_, err = f.Write(buf)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	err = f.Close()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	_, _ = sf.Seek(0, io.SeekStart)
-
-	f, err = NewFromSparseFile(&sf, os.O_RDONLY)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	buf1 := make([]byte, len(buf))
-
-	_, err = io.ReadFull(f, buf1)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if !bytes.Equal(buf, buf1) {
-		t.Fatal("Blocks differ")
-	}
+	ct.open(0, false)
+	blockSize := ct.sf.blockSize
+	ct.writeRandomBlock(0, int(blockSize/2))
+	ct.writeUniformBlock(blockSize/2, int(blockSize/2)-2, 0)
+	ct.reopen(false)
+	ct.writeUniformBlock(0, int(blockSize)-1, 'x')
+	ct.check()
 }
 
 func TestCompressedTruncate(t *testing.T) {
-	var sf memSparseFile
-	f, err := NewFromSparseFile(&sf, os.O_RDWR|os.O_CREATE)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ct := &cmpTest{t: t}
+
+	ct.open(0, false)
 
 	buf := make([]byte, 1*1024*1024)
+	rand.Read(buf)
+	ct.write(buf)
 
-	for i := 0; i < len(buf); i++ {
-		buf[i] = byte(rand.Int31n(256))
-	}
+	ct.truncate(163999)
+	ct.checkSize(163999)
 
-	_, err = f.Write(buf)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ct.truncate(63999)
+	ct.checkSize(63999)
 
-	err = f.Truncate(163999)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ct.truncate(ct.sf.blockSize)
+	ct.checkSize(ct.sf.blockSize)
 
-	sz, err := f.Size()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if sz != 163999 {
-		t.Fatalf("Unexpected size; %d", sz)
-	}
-
-	err = f.Truncate(63999)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	sz, err = f.Size()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if sz != 63999 {
-		t.Fatalf("Unexpected size; %d", sz)
-	}
-
-	err = f.Truncate(f.blockSize)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	sz, err = f.Size()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if sz != f.blockSize {
-		t.Fatalf("Unexpected size; %d", sz)
-	}
-
+	ct.check()
 }
 
 func TestTruncateExpandWithDirtyLastBlock(t *testing.T) {
-	var sf memSparseFile
+	ct := &cmpTest{t: t}
 
-	f, err := NewFromSparseFileSize(&sf, os.O_RDWR|os.O_CREATE, MinBlockSize)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ct.open(MinBlockSize, false)
 
 	block := make([]byte, MinBlockSize+1000)
 	rand.Read(block)
+	ct.write(block)
 
-	_, err = f.Write(block)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ct.truncate(MinBlockSize*2 + 1000)
 
-	err = f.Truncate(MinBlockSize*2 + 1000)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ct.seek(0, io.SeekStart)
 
-	_, err = f.Seek(0, io.SeekStart)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ct.readFull(block[:MinBlockSize]) // flush the 2nd block
 
-	_, err = f.Read(block[:MinBlockSize]) // flush the 2nd block
-	if err != nil {
-		t.Fatal(err)
-	}
+	ct.checkSize(MinBlockSize*2 + 1000)
 
-	size, err := f.Size()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if size != MinBlockSize*2+1000 {
-		t.Fatalf("size: %d", size)
-	}
+	ct.check()
+}
+
+func TestTruncateNoChange(t *testing.T) {
+	ct := &cmpTest{t: t}
+
+	ct.open(MinBlockSize, false)
+	ct.writeRandomBlock(0, MinBlockSize*3/2)
+	ct.sync()
+	ct.truncate(MinBlockSize * 3 / 2)
+	ct.check()
 }
 
 func TestTruncateExpandWithinBlock(t *testing.T) {
-	var sf memSparseFile
+	ct := &cmpTest{t: t}
 
-	f, err := NewFromSparseFileSize(&sf, os.O_RDWR|os.O_CREATE, MinBlockSize)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ct.open(MinBlockSize, false)
 
 	block := make([]byte, MinBlockSize+1000)
 	rand.Read(block)
+	ct.write(block)
 
-	_, err = f.Write(block)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	err = f.Truncate(MinBlockSize + 2000)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ct.truncate(MinBlockSize + 2000)
 
 	buf := make([]byte, 1000)
-	_, err = f.ReadAt(buf, MinBlockSize+1000)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ct.readAt(buf, MinBlockSize+1000)
 	if !IsBlockZero(buf) {
 		t.Fatal("not zero")
 	}
+
+	ct.check()
 }
 
 func TestTruncateExactlyAtBlockBoundary(t *testing.T) {
-	var sf memSparseFile
+	ct := &cmpTest{t: t}
 
-	f, err := NewFromSparseFileSize(&sf, os.O_RDWR|os.O_CREATE, MinBlockSize)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ct.open(MinBlockSize, false)
 
 	block := make([]byte, MinBlockSize*2+1000)
 	rand.Read(block)
 
-	_, err = f.Write(block)
-	if err != nil {
-		t.Fatal(err)
+	ct.write(block)
+
+	ct.readAt(block[:MinBlockSize], 0)
+	ct.truncate(MinBlockSize * 2)
+	ct.checkSize(MinBlockSize * 2)
+
+	ct.check()
+}
+
+func TestTruncate1(t *testing.T) {
+	ct := &cmpTest{t: t}
+
+	ct.open(0, false)
+	blockSize := ct.sf.blockSize
+
+	ct.writeUniformBlock(0, int(blockSize/2), 'x')
+	ct.writeUniformBlock(blockSize, int(blockSize), 'x')
+
+	ct.truncate(blockSize/2 + 10)
+	ct.reopen(true)
+	ct.checkSize(blockSize/2 + 10)
+
+	ct.check()
+}
+
+func TestTruncate2(t *testing.T) {
+	ct := &cmpTest{t: t}
+
+	ct.open(0, false)
+	blockSize := ct.sf.blockSize
+
+	ct.writeUniformBlock(0, int(blockSize), 'x')
+	ct.writeUniformBlock(blockSize, int(blockSize/2), 'x')
+	ct.writeUniformBlock(blockSize*2, int(blockSize), 'x')
+
+	ct.reopen(false)
+
+	buf1 := make([]byte, 100)
+	ct.writeAt(buf1, 0)
+
+	ct.truncate(blockSize*3/2 + 10)
+	ct.reopen(true)
+	ct.checkSize(blockSize*3/2 + 10)
+
+	ct.check()
+}
+
+func TestTruncateInvalidateCurrentBlock(t *testing.T) {
+	ct := &cmpTest{t: t}
+
+	ct.open(0, false)
+	blockSize := ct.sf.blockSize
+
+	ct.writeUniformBlock(0, int(blockSize*2), 'x')
+	ct.sync()
+
+	buf1 := make([]byte, int(blockSize))
+	ct.readAt(buf1, blockSize)
+	ct.truncate(blockSize / 2)
+
+	n, err := ct.sf.ReadAt(buf1, blockSize)
+	if err != io.EOF {
+		t.Fatal("expected EOF")
+	}
+	if n != 0 {
+		t.Fatal(n)
 	}
 
-	_, err = f.ReadAt(block[:MinBlockSize], 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = f.Truncate(MinBlockSize * 2)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ct.writeUniformBlock(blockSize, int(blockSize), 'x')
+	ct.writeUniformBlock(blockSize*2, int(blockSize), 'x')
 
-	size, err := f.Size()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if size != MinBlockSize*2 {
-		t.Fatal(size)
-	}
+	ct.truncate(blockSize)
+	ct.checkSize(blockSize)
+
+	ct.sync()
+	ct.checkSize(blockSize)
+
+	ct.check()
+}
+
+func TestTruncateLastBlockInWriteQueue(t *testing.T) {
+	ct := &cmpTest{t: t}
+
+	ct.open(0, false)
+	blockSize := ct.sf.blockSize
+
+	ct.writeUniformBlock(0, int(blockSize), 'x')
+	ct.writeUniformBlock(blockSize, int(blockSize), 'x')
+
+	buf1 := make([]byte, blockSize)
+
+	ct.readAt(buf1, 0)
+	ct.truncate(blockSize + blockSize/2)
+	ct.checkSize(blockSize + blockSize/2)
+
+	ct.sync()
+	ct.checkSize(blockSize + blockSize/2)
+
+	ct.check()
+}
+
+func TestTruncateAndZero(t *testing.T) {
+	ct := &cmpTest{t: t}
+
+	ct.open(0, false)
+	blockSize := ct.sf.blockSize
+
+	ct.writeUniformBlock(0, int(blockSize), 'x')
+	ct.sync()
+
+	buf1 := make([]byte, blockSize)
+
+	ct.writeAt(buf1, 0)
+	ct.sync()
+
+	ct.truncate(blockSize / 2)
+
+	ct.check()
+}
+
+func TestTruncateAndZeroBlockNotInCache(t *testing.T) {
+	ct := &cmpTest{t: t}
+
+	ct.open(MinBlockSize, false)
+	ct.writeUniformBlock(0, MinBlockSize/2, 0)
+	ct.writeUniformBlock(MinBlockSize/2, MinBlockSize/2, 'z')
+	ct.sync()
+	ct.truncate(MinBlockSize / 2)
+	ct.check()
+}
+
+func TestOverwriteLastCompressedWithZeros(t *testing.T) {
+	ct := &cmpTest{t: t}
+
+	ct.open(0, false)
+	blockSize := ct.sf.blockSize
+
+	ct.writeUniformBlock(0, int(blockSize), 'x')
+	ct.sync()
+
+	buf1 := make([]byte, blockSize)
+
+	ct.writeAt(buf1, 0)
+
+	ct.check()
+}
+
+func TestTruncateCurrentBlockInQueue(t *testing.T) {
+	ct := &cmpTest{t: t}
+
+	ct.open(0, false)
+	blockSize := ct.sf.blockSize
+
+	ct.writeUniformBlock(0, int(blockSize*2), 'x')
+
+	buf1 := make([]byte, blockSize)
+	ct.readAt(buf1, 0)
+
+	ct.truncate(blockSize / 2)
+
+	ct.writeUniformBlock(0, 100, 'x')
+
+	ct.sync()
+	ct.checkSize(blockSize / 2)
+
+	ct.check()
 }
 
 func TestPunchHole(t *testing.T) {
-	var sf memSparseFile
-	f, err := NewFromSparseFile(&sf, os.O_RDWR|os.O_CREATE)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ct := &cmpTest{t: t}
+
+	ct.open(0, false)
 
 	buf := make([]byte, 1*1024*1024)
-
 	rand.Read(buf)
+	ct.write(buf)
 
-	_, err = f.Write(buf)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	err = f.PunchHole(100, 200)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ct.punchHole(100, 200)
 
 	buf1 := append([]byte(nil), buf...)
 	for i := 100; i < 300; i++ {
 		buf1[i] = 0
 	}
 
-	_, _ = f.Seek(0, io.SeekStart)
-	buf2, err := io.ReadAll(f)
+	ct.seek(0, io.SeekStart)
+	buf2, err := io.ReadAll(ct.sf)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -415,17 +331,23 @@ func TestPunchHole(t *testing.T) {
 		t.Fatal("not equal")
 	}
 
-	err = f.PunchHole(3333, 777777)
-	if err != nil {
-		t.Fatal(err)
-	}
-
+	ct.punchHole(3333, 777777)
 	for i := 3333; i < 3333+777777; i++ {
 		buf1[i] = 0
 	}
 
-	_, _ = f.Seek(0, io.SeekStart)
-	buf2, err = io.ReadAll(f)
+	ct.punchHole(6*DefBlockSize, DefBlockSize)
+	for i := 6 * DefBlockSize; i < 7*DefBlockSize; i++ {
+		buf1[i] = 0
+	}
+
+	ct.punchHole(7*DefBlockSize+222, 10*DefBlockSize)
+	for i := 7*DefBlockSize + 222; i < len(buf1); i++ {
+		buf1[i] = 0
+	}
+
+	ct.seek(0, io.SeekStart)
+	buf2, err = io.ReadAll(ct.sf)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -433,99 +355,79 @@ func TestPunchHole(t *testing.T) {
 	if !bytes.Equal(buf2, buf1) {
 		t.Fatal("not equal")
 	}
+
+	ct.reopen(true)
+
+	buf2, err = io.ReadAll(ct.sf)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !bytes.Equal(buf2, buf1) {
+		t.Fatal("not equal after reopen")
+	}
+
+	ct.check()
+}
+
+func TestPunchHoleKeepSize(t *testing.T) {
+	ct := &cmpTest{t: t}
+
+	ct.open(0, false)
+	blockSize := ct.sf.blockSize
+
+	buf := make([]byte, blockSize)
+	ct.writeAt(buf, 0)
+
+	ct.sync()
+
+	ct.writeAt(buf[:len(buf)/2], blockSize)
+
+	ct.punchHole(0, blockSize*2)
+	ct.checkSize(blockSize + blockSize/2)
+
+	ct.writeAt(buf, blockSize)
+
+	ct.punchHole(0, 3*blockSize)
+	ct.checkSize(2 * blockSize)
+
+	ct.check()
 }
 
 func TestReadFromDirtyBuffer(t *testing.T) {
-	var sf memSparseFile
-	f, err := NewFromSparseFileSize(&sf, os.O_RDWR|os.O_CREATE, MinBlockSize)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ct := &cmpTest{t: t}
 
-	buf := make([]byte, MinBlockSize+1)
-	for i := range buf {
-		buf[i] = 'x'
-	}
+	ct.open(MinBlockSize, false)
 
-	_, err = f.Write(buf)
-	if err != nil {
-		t.Fatal(err)
-	}
+	buf := bytes.Repeat([]byte{'x'}, MinBlockSize+1)
 
-	_, err = f.Seek(MinBlockSize+1001, io.SeekStart)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ct.write(buf)
 
-	rd := bytes.NewBuffer(buf)
-	_, err = f.ReadFrom(rd)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ct.seek(MinBlockSize+1001, io.SeekStart)
 
-	f.Close()
-	_, err = sf.Seek(0, io.SeekStart)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ct.readFrom(buf)
 
-	f1, err := NewFromSparseFile(&sf, os.O_RDONLY)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	s, err := f1.Size()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if s != 2*(MinBlockSize+1)+1000 {
-		t.Fatal(s)
-	}
-	buf1 := make([]byte, s)
-
-	_, err = io.ReadFull(f1, buf1)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	expectRange(buf1, 0, len(buf), 'x', t)
-
-	expectRange(buf1, len(buf), 1000, 0, t)
-
-	expectRange(buf1, len(buf)+1000, len(buf), 'x', t)
-
+	ct.reopen(true)
+	ct.check()
 }
 
 func TestCorruptedCompression(t *testing.T) {
-	var sf memSparseFile
+	ct := &cmpTest{t: t}
 
-	f, err := NewFromSparseFileSize(&sf, os.O_RDWR|os.O_CREATE, MinBlockSize)
-	if err != nil {
-		t.Fatal(err)
-	}
-	buf := make([]byte, MinBlockSize)
-	for i := range buf {
-		buf[i] = 'x'
-	}
-	_, err = f.WriteAt(buf, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = f.WriteAt(buf, MinBlockSize)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ct.open(MinBlockSize, false)
+	ct.writeUniformBlock(0, MinBlockSize*2, 'x')
+
+	ct.sync()
 
 	// corrupting the first block
 	zeroBuf := make([]byte, 1000)
-	_, err = sf.WriteAt(zeroBuf, headerSize+16)
+	_, err := ct.f.WriteAt(zeroBuf, headerSize+16)
 	if err != nil {
 		t.Fatal(err)
 	}
 
 	rbuf := make([]byte, MinBlockSize)
-	n, err := f.ReadAt(rbuf, 0)
+	n, err := ct.sf.ReadAt(rbuf, 0)
 	if err == nil {
 		t.Fatal("err is nil")
 	}
@@ -545,47 +447,35 @@ func TestCorruptedCompression(t *testing.T) {
 	}
 
 	// Attempting to re-write part of the corrupted block
-	_, err = f.WriteAt(buf, 100)
+	buf := bytes.Repeat([]byte{'x'}, MinBlockSize)
+	_, err = ct.sf.WriteAt(buf, 100)
 	if err == nil {
 		t.Fatal("err is nil")
 	}
 
 	// Attempting to re-write the whole corrupted block
-	_, err = f.WriteAt(buf, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ct.writeAt(buf, 0)
+
+	ct.check()
 }
 
 func TestCorruptedCompressionHeader(t *testing.T) {
-	var sf memSparseFile
+	ct := &cmpTest{t: t}
 
-	f, err := NewFromSparseFileSize(&sf, os.O_RDWR|os.O_CREATE, MinBlockSize)
-	if err != nil {
-		t.Fatal(err)
-	}
-	buf := make([]byte, MinBlockSize)
-	for i := range buf {
-		buf[i] = 'x'
-	}
-	_, err = f.WriteAt(buf, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = f.WriteAt(buf, MinBlockSize)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ct.open(MinBlockSize, false)
+	ct.writeUniformBlock(0, MinBlockSize*2, 'x')
 
-	if sf.data[4096] != 1 {
+	ct.sync()
+
+	if ct.f.data[4096] != 1 {
 		t.Fatal("first block is not compressed")
 	}
 
 	// corrupting the first block gzip header
-	sf.data[4098] = ^sf.data[4098]
+	ct.f.data[4098] = ^ct.f.data[4098]
 
 	rbuf := make([]byte, MinBlockSize)
-	n, err := f.ReadAt(rbuf, 0)
+	n, err := ct.sf.ReadAt(rbuf, 0)
 	if err == nil {
 		t.Fatal("err is nil")
 	}
@@ -606,69 +496,40 @@ func TestCorruptedCompressionHeader(t *testing.T) {
 }
 
 func TestCorruptedLastBlock(t *testing.T) {
-	var sf memSparseFile
+	ct := &cmpTest{t: t}
 
-	f, err := NewFromSparseFileSize(&sf, os.O_RDWR|os.O_CREATE, MinBlockSize)
-	if err != nil {
-		t.Fatal(err)
-	}
-	buf := make([]byte, MinBlockSize)
-	for i := range buf {
-		buf[i] = 'x'
-	}
-	_, err = f.WriteAt(buf, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = f.WriteAt(buf[:MinBlockSize-200], MinBlockSize)
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = f.Close()
-	if err != nil {
-		t.Fatal(err)
-	}
+	ct.open(MinBlockSize, false)
+	buf := bytes.Repeat([]byte{'x'}, MinBlockSize)
+
+	ct.writeAt(buf, 0)
+	ct.writeAt(buf[:MinBlockSize-200], MinBlockSize)
+	ct.sync()
 
 	// corrupting the last block
 	zeroBuf := make([]byte, 1000)
-	_, err = sf.WriteAt(zeroBuf, headerSize+MinBlockSize+16)
+	_, err := ct.f.WriteAt(zeroBuf, headerSize+MinBlockSize+16)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	_, _ = sf.Seek(0, io.SeekStart)
-
-	f, err = NewFromSparseFileSize(&sf, os.O_RDWR, MinBlockSize)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	s, err := f.Size()
+	s, err := ct.sf.Size()
 	if err == nil {
 		t.Fatal("no error")
 	}
 
 	// Truncating to fix the error
-	err = f.Truncate(MinBlockSize)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ct.truncate(MinBlockSize)
 
 	// Attempting to write after the end of file
-	_, err = f.WriteAt(buf[:1], s)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ct.writeAt(buf[:1], s)
 
+	ct.check()
 }
 
 func testShrinkLastBlock(t *testing.T, lastBlockSize int64, compressed bool) {
-	var sf memSparseFile
+	ct := &cmpTest{t: t}
 
-	f, err := NewFromSparseFileSize(&sf, os.O_RDWR|os.O_CREATE, MinBlockSize)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ct.open(MinBlockSize, false)
 
 	buf := make([]byte, MinBlockSize)
 	if compressed {
@@ -678,78 +539,22 @@ func testShrinkLastBlock(t *testing.T, lastBlockSize int64, compressed bool) {
 	} else {
 		rand.Read(buf)
 	}
-	_, err = f.Write(buf)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ct.write(buf)
 
-	_, err = f.Write(buf[:lastBlockSize])
-	if err != nil {
-		t.Fatal(err)
-	}
-	err = f.Close()
-	if err != nil {
-		t.Fatal(err)
-	}
+	ct.write(buf[:lastBlockSize])
 
-	_, err = sf.Seek(0, io.SeekStart)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ct.reopen(false)
+	ct.checkSize(MinBlockSize + lastBlockSize)
 
-	f, err = NewFromSparseFileSize(&sf, os.O_RDWR, MinBlockSize)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ct.writeAt(buf[:lastBlockSize/2], MinBlockSize)
 
-	if s, err := f.Size(); err != nil {
-		t.Fatal(err)
-	} else {
-		if s != MinBlockSize+lastBlockSize {
-			t.Fatalf("size: %d", s)
-		}
-	}
+	ct.reopen(false)
+	ct.checkSize(MinBlockSize + lastBlockSize)
 
-	_, err = f.WriteAt(buf[:lastBlockSize/2], MinBlockSize)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ct.truncate(MinBlockSize)
+	ct.checkSize(MinBlockSize)
 
-	err = f.Close()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	_, err = sf.Seek(0, io.SeekStart)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	f, err = NewFromSparseFileSize(&sf, os.O_RDWR, MinBlockSize)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if s, err := f.Size(); err != nil {
-		t.Fatal(err)
-	} else {
-		if s != MinBlockSize+lastBlockSize {
-			t.Fatalf("size: %d", s)
-		}
-	}
-
-	err = f.Truncate(MinBlockSize)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if s, err := f.Size(); err != nil {
-		t.Fatal(err)
-	} else {
-		if s != MinBlockSize {
-			t.Fatalf("size: %d", s)
-		}
-	}
+	ct.check()
 }
 
 func TestShrinkLastBlock(t *testing.T) {
@@ -771,35 +576,109 @@ func TestShrinkLastBlock(t *testing.T) {
 }
 
 func TestSize(t *testing.T) {
-	var sf memSparseFile
+	ct := &cmpTest{t: t}
 
-	f, err := NewFromSparseFile(&sf, os.O_RDWR|os.O_CREATE)
-	if err != nil {
-		t.Fatal(err)
-	}
+	ct.open(0, false)
+	ct.checkSize(0)
 
-	s, err := f.Size()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if s != 0 {
-		t.Fatal(s)
-	}
+	ct.writeRandomBlock(0, 4096)
+	ct.checkSize(4096)
+}
 
-	buf := make([]byte, 4096)
-	rand.Read(buf)
-	_, err = f.Write(buf)
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestSizePartialBlock(t *testing.T) {
+	ct := &cmpTest{t: t}
 
-	s, err = f.Size()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if s != int64(len(buf)) {
-		t.Fatal(s)
-	}
+	ct.open(0, false)
+	blockSize := ct.sf.blockSize
+	ct.writeRandomBlock(0, int(blockSize))
+	ct.reopen(false)
+	ct.writeRandomBlock(0, int(blockSize/2))
+	ct.checkSize(blockSize)
+}
+
+func TestLastCompressedShortExpand(t *testing.T) {
+	ct := &cmpTest{t: t}
+
+	ct.open(0, false)
+	blockSize := ct.sf.blockSize
+	buf := bytes.Repeat([]byte{'x'}, int(blockSize-7))
+	ct.write(buf)
+	ct.reopen(false)
+	ct.seek(blockSize, io.SeekStart)
+
+	block1 := []byte("Second block")
+	ct.writeAt(block1, blockSize)
+
+	ct.reopen(true)
+	ct.check()
+}
+
+func TestPartialRead(t *testing.T) {
+	ct := &cmpTest{t: t}
+
+	ct.open(0, false)
+	blockSize := ct.sf.blockSize
+	ct.writeRandomBlock(0, int(blockSize))
+	ct.sync()
+	ct.writeUniformBlock(0, 100, 'z')
+	ct.writeUniformBlock(200, 100, 'z')
+	ct.check()
+}
+
+func TestPartialOverwriteInQueue(t *testing.T) {
+	ct := &cmpTest{t: t}
+
+	ct.open(MinBlockSize, false)
+	ct.writeRandomBlock(0, MinBlockSize*2)
+	ct.writeRandomBlock(0, 1000)
+	ct.check()
+}
+
+func TestOverwriteUncompressed(t *testing.T) {
+	ct := &cmpTest{t: t}
+
+	ct.open(0, false)
+	blockSize := ct.sf.blockSize
+	ct.writeRandomBlock(0, int(blockSize))
+	ct.sync()
+	buf := make([]byte, blockSize)
+	ct.readAt(buf, 0)
+	ct.writeUniformBlock(0, int(blockSize), 'x')
+	ct.reopen(true)
+	ct.check()
+}
+
+func TestOverwriteExpand(t *testing.T) {
+	ct := &cmpTest{t: t}
+
+	ct.open(0, false)
+	ct.writeUniformBlock(0, 1000, 'x')
+	ct.sync()
+	ct.writeUniformBlock(0, 2000, 'z')
+	ct.sync()
+	ct.check()
+}
+
+func TestPartialOverwriteReadFromQueue(t *testing.T) {
+	ct := &cmpTest{t: t}
+
+	ct.open(MinBlockSize, false)
+	ct.writeRandomBlock(0, MinBlockSize*3/2)
+	ct.sync()
+	ct.writeRandomBlock(MinBlockSize, 1000)
+	ct.checkNoSync()
+}
+
+func TestPartialReadTruncate(t *testing.T) {
+	ct := &cmpTest{t: t}
+
+	ct.open(0, false)
+	blockSize := ct.sf.blockSize
+	ct.writeRandomBlock(0, int(blockSize)/2)
+	ct.reopen(false)
+	ct.writeRandomBlock(0, int(blockSize)/4)
+	ct.truncate(blockSize / 4)
+	ct.check()
 }
 
 func zeroTest1(buf []byte) bool {
@@ -906,5 +785,270 @@ func TestIsBlockZero(t *testing.T) {
 
 	if !IsBlockZero(buf[:0]) {
 		t.Fatal("empty block is not zero")
+	}
+}
+
+// Utilities
+
+type memSparseFile struct {
+	data   []byte
+	offset int64
+}
+
+func (s *memSparseFile) Read(buf []byte) (n int, err error) {
+	if s.offset >= int64(len(s.data)) {
+		err = io.EOF
+		return
+	}
+	n = copy(buf, s.data[s.offset:])
+	s.offset += int64(n)
+	return
+}
+
+func (s *memSparseFile) ensureSize(newSize int64) {
+	if newSize > int64(len(s.data)) {
+		if newSize <= int64(cap(s.data)) {
+			l := int64(len(s.data))
+			s.data = s.data[:newSize]
+			for i := l; i < newSize; i++ {
+				s.data[i] = 0
+			}
+		} else {
+			d := make([]byte, newSize)
+			copy(d, s.data)
+			s.data = d
+		}
+	}
+}
+
+func (s *memSparseFile) Write(buf []byte) (n int, err error) {
+	s.ensureSize(s.offset + int64(len(buf)))
+	n = copy(s.data[s.offset:], buf)
+	if n < len(buf) {
+		err = io.ErrShortWrite
+	}
+	s.offset += int64(n)
+	return
+}
+
+func (s *memSparseFile) Seek(offset int64, whence int) (int64, error) {
+	switch whence {
+	case io.SeekStart:
+		s.offset = offset
+		return s.offset, nil
+	case io.SeekCurrent:
+		s.offset += offset
+		return s.offset, nil
+	case io.SeekEnd:
+		s.offset = int64(len(s.data)) + offset
+		return s.offset, nil
+	}
+	return s.offset, errors.New("invalid whence")
+}
+
+func (s *memSparseFile) Truncate(size int64) error {
+	if size > int64(len(s.data)) {
+		if size <= int64(cap(s.data)) {
+			l := len(s.data)
+			s.data = s.data[:size]
+			for i := l; i < len(s.data); i++ {
+				s.data[i] = 0
+			}
+		} else {
+			d := make([]byte, size)
+			copy(d, s.data)
+			s.data = d
+		}
+	} else if size < int64(len(s.data)) {
+		s.data = s.data[:size]
+	}
+	return nil
+}
+
+func (s *memSparseFile) PunchHole(offset, size int64) error {
+	if offset < int64(len(s.data)) {
+		d := offset + size - int64(len(s.data))
+		if d > 0 {
+			size -= d
+		}
+		for i := offset; i < offset+size; i++ {
+			s.data[i] = 0
+		}
+	}
+	return nil
+}
+
+func (s *memSparseFile) ReadAt(p []byte, off int64) (n int, err error) {
+	if off < int64(len(s.data)) {
+		n = copy(p, s.data[off:])
+	}
+	if n < len(p) {
+		err = io.EOF
+	}
+	return
+}
+
+func (s *memSparseFile) WriteAt(p []byte, off int64) (n int, err error) {
+	s.ensureSize(off + int64(len(p)))
+	n = copy(s.data[off:], p)
+	return
+}
+
+func (s *memSparseFile) Close() error {
+	return nil
+}
+
+func (s *memSparseFile) Sync() error {
+	return nil
+}
+
+func (s *memSparseFile) Bytes() []byte {
+	return s.data
+}
+
+type cmpTest struct {
+	t      *testing.T
+	f, ref memSparseFile
+	sf     *SpgzFile
+}
+
+func (ct *cmpTest) fatal(args ...interface{}) {
+	ct.t.Log(args...)
+	ct.t.Log(string(debug.Stack()))
+	ct.t.FailNow()
+}
+
+func (ct *cmpTest) open(blockSize int64, readOnly bool) {
+	var flag int
+	if readOnly {
+		flag = os.O_RDONLY
+	} else {
+		flag = os.O_RDWR | os.O_CREATE
+	}
+	var err error
+	if blockSize > 0 {
+		ct.sf, err = NewFromSparseFileSize(&ct.f, flag, blockSize)
+	} else {
+		ct.sf, err = NewFromSparseFile(&ct.f, flag)
+	}
+	if err != nil {
+		ct.fatal(err)
+	}
+}
+
+func (ct *cmpTest) readFull(buf []byte) {
+	_, err := io.ReadFull(ct.sf, buf)
+	if err != nil {
+		ct.fatal(err)
+	}
+}
+
+func (ct *cmpTest) readAt(buf []byte, offset int64) {
+	_, err := ct.sf.ReadAt(buf, offset)
+	if err != nil {
+		ct.fatal(err)
+	}
+}
+
+func (ct *cmpTest) writeAt(block []byte, offset int64) {
+	_, err := ct.sf.WriteAt(block, offset)
+	if err != nil {
+		ct.fatal(err)
+	}
+	_, _ = ct.ref.WriteAt(block, offset)
+}
+
+func (ct *cmpTest) writeUniformBlock(offset int64, size int, filler byte) {
+	ct.writeAt(bytes.Repeat([]byte{filler}, size), offset)
+}
+
+func (ct *cmpTest) writeRandomBlock(offset int64, size int) {
+	buf := make([]byte, size)
+	rand.Read(buf)
+	ct.writeAt(buf, offset)
+}
+
+func (ct *cmpTest) write(buf []byte) {
+	_, err := ct.sf.Write(buf)
+	if err != nil {
+		ct.fatal(err)
+	}
+	_, _ = ct.ref.Write(buf)
+}
+
+func (ct *cmpTest) readFrom(buf []byte) {
+	rd := bytes.NewBuffer(buf)
+	_, err := ct.sf.ReadFrom(rd)
+	if err != nil {
+		ct.fatal(err)
+	}
+	_, _ = io.Copy(&ct.ref, bytes.NewBuffer(buf))
+}
+
+func (ct *cmpTest) seek(offset int64, whence int) int64 {
+	o, err := ct.sf.Seek(offset, whence)
+	if err != nil {
+		ct.fatal(err)
+	}
+	_, _ = ct.ref.Seek(offset, whence)
+	return o
+}
+
+func (ct *cmpTest) truncate(size int64) {
+	err := ct.sf.Truncate(size)
+	if err != nil {
+		ct.fatal(err)
+	}
+	_ = ct.ref.Truncate(size)
+}
+
+func (ct *cmpTest) punchHole(offset, size int64) {
+	err := ct.sf.PunchHole(offset, size)
+	if err != nil {
+		ct.fatal(err)
+	}
+	_ = ct.ref.PunchHole(offset, size)
+}
+
+func (ct *cmpTest) sync() {
+	err := ct.sf.Sync()
+	if err != nil {
+		ct.fatal(err)
+	}
+}
+
+func (ct *cmpTest) reopen(readOnly bool) {
+	err := ct.sf.Close()
+	if err != nil {
+		ct.fatal(err)
+	}
+	_, _ = ct.f.Seek(0, io.SeekStart)
+	ct.open(0, readOnly)
+}
+
+func (ct *cmpTest) checkSize(size int64) {
+	actual, err := ct.sf.Size()
+	if err != nil {
+		ct.fatal(err)
+	}
+	if actual != size {
+		ct.fatal(actual)
+	}
+}
+
+func (ct *cmpTest) check() {
+	ct.checkNoSync()
+	ct.sync()
+	ct.checkNoSync()
+}
+
+func (ct *cmpTest) checkNoSync() {
+	ct.seek(0, io.SeekStart)
+	buf, err := ioutil.ReadAll(ct.sf)
+	if err != nil {
+		ct.fatal(err)
+	}
+	if !bytes.Equal(buf, ct.ref.Bytes()) {
+		ct.fatal("consistency check failed")
 	}
 }

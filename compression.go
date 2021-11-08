@@ -14,6 +14,8 @@ import (
 const (
 	headerMagic = "SPGZ0001"
 	headerSize  = 4096
+
+	writeQueueSize = 32
 )
 
 const (
@@ -65,8 +67,13 @@ type block struct {
 	num                 int64
 	data                []byte
 	rawBlock, dataBlock []byte
-	blockIsRaw          bool
-	dirty               bool
+	// True when data is pointing to rawBlock rather than dataBlock.
+	dataIsRaw bool
+	dirty     bool
+	// When data is written to a block that is currently not loaded it's not loaded immediately
+	// (in anticipation that it will be overwritten in full so no loading will be necessary).
+	// It's only loaded when it's read or written beyond the current data slice. When it is, this flag is set.
+	full bool
 }
 
 type SpgzFile struct {
@@ -75,19 +82,37 @@ type SpgzFile struct {
 	blockSize int64
 	readOnly  bool
 
-	block  block
-	loaded bool
-	offset int64
+	block    block
+	tmpBlock block
+	gzReader *gzip.Reader
+	// Contains a list of consecutive blocks ready to be written. When the queue is flushed, first a single
+	// hole is punched across the whole area, then individual blocks are written. This helps reduce the number
+	// of fallocate() calls which seem to be quite expensive, at least on btrfs.
+	writeQueue []block
+	offset     int64
+	size       int64
+	loaded     bool
 }
 
 func (b *block) init(f *SpgzFile) {
 	b.f = f
 	b.dirty = false
-	b.blockIsRaw = false
+	b.dataIsRaw = false
 }
 
-func (b *block) load(num int64) error {
-	b.num = num
+// Completes a partially overwritten block by reading the rest.
+// b.data at this point contains the overwritten part.
+func (b *block) readTail() error {
+	if !b.full && int64(len(b.data)) < b.f.blockSize {
+		return b.read(true)
+	}
+	return nil
+}
+
+func (b *block) read(tail bool) error {
+	if tail {
+		b.prepareWrite()
+	}
 	if b.rawBlock == nil {
 		b.rawBlock = make([]byte, b.f.blockSize+1)
 	} else {
@@ -97,37 +122,61 @@ func (b *block) load(num int64) error {
 	if b.dataBlock == nil {
 		b.dataBlock = make([]byte, b.f.blockSize)
 	}
-
-	n, err := b.f.f.ReadAt(b.rawBlock, headerSize+num*(b.f.blockSize+1))
+	n, err := b.f.f.ReadAt(b.rawBlock, headerSize+b.num*(b.f.blockSize+1))
 	if err != nil {
 		if err == io.EOF {
 			if n > 0 {
 				b.rawBlock = b.rawBlock[:n]
 				err = nil
 			} else {
-				b.data = b.dataBlock[:0]
-				b.blockIsRaw = false
-				b.dirty = false
-				return err
+				b.full = true
+				if !tail {
+					b.data = b.dataBlock[:0]
+					b.dataIsRaw = false
+					b.dirty = false
+					return err
+				} else {
+					return nil
+				}
 			}
 		} else {
-			b.data = b.dataBlock[:0]
-			b.blockIsRaw = false
+			if !tail {
+				b.data = b.dataBlock[:0]
+				b.dataIsRaw = false
+			}
 			return err
 		}
 	}
 
 	switch b.rawBlock[0] {
 	case blkUncompressed:
-		b.data = b.rawBlock[1:]
-		b.blockIsRaw = true
+		if tail {
+			if len(b.rawBlock)-1 > len(b.data) {
+				l := len(b.data)
+				b.data = b.data[:len(b.rawBlock)-1]
+				copy(b.data[l:], b.rawBlock[l+1:])
+			}
+		} else {
+			b.data = b.rawBlock[1:]
+			b.dataIsRaw = true
+		}
 	case blkCompressed:
-		err = b.loadCompressed()
+		err = b.loadCompressed(tail)
 	}
 
-	b.dirty = false
+	if err == nil {
+		b.full = true
+	}
+	if !tail {
+		b.dirty = false
+	}
 
 	return err
+}
+
+func (b *block) load(num int64) error {
+	b.num = num
+	return b.read(false)
 }
 
 func (b *block) createCorruptBlockError(err error) *ErrCorruptCompressedBlock {
@@ -142,29 +191,36 @@ func (b *block) createCorruptBlockError(err error) *ErrCorruptCompressedBlock {
 	}
 }
 
-func (b *block) loadCompressed() error {
-	z, err := gzip.NewReader(bytes.NewBuffer(b.rawBlock[1:]))
+func (b *block) loadCompressed(tail bool) error {
+	z := b.f.gzReader
+	err := z.Reset(bytes.NewBuffer(b.rawBlock[1:]))
 	if err != nil {
 		return b.createCorruptBlockError(err)
 	}
 	z.Multistream(false)
 
-	buf := bytes.NewBuffer(b.dataBlock[:0])
+	if !tail {
+		b.data = b.dataBlock[:0]
+		b.dataIsRaw = false
+	}
+	buf := bytes.NewBuffer(b.data)
 
+	if len(b.data) > 0 {
+		_, err := io.CopyN(io.Discard, z, int64(len(b.data)))
+		if err != nil && err != io.EOF {
+			return b.createCorruptBlockError(err)
+		}
+
+	}
 	_, err = io.Copy(buf, z)
 	if err != nil {
 		return b.createCorruptBlockError(err)
 	}
 	b.data = buf.Bytes()
-	b.blockIsRaw = false
 
 	l := int64(len(b.data))
 	if l < b.f.blockSize {
-		o, err := b.f.f.Seek(0, io.SeekEnd)
-		if err != nil {
-			return err
-		}
-		lastBlockNum := (o - headerSize) / (b.f.blockSize + 1)
+		lastBlockNum := (b.f.size - headerSize) / (b.f.blockSize + 1)
 		if lastBlockNum > b.num {
 			b.data = b.data[:b.f.blockSize]
 			for i := l; i < b.f.blockSize; i++ {
@@ -176,17 +232,21 @@ func (b *block) loadCompressed() error {
 	return nil
 }
 
-func (b *block) store(truncate bool) (err error) {
+func (b *block) store() (err error) {
 	var curOffset int64
 
 	if len(b.data) == 0 {
 		curOffset = headerSize + b.num*(b.f.blockSize+1)
 	} else if IsBlockZero(b.data) {
-		err = b.f.f.PunchHole(headerSize+b.num*(b.f.blockSize+1), int64(len(b.data))+1)
-		if err != nil {
-			return err
-		}
 		curOffset = headerSize + b.num*(b.f.blockSize+1) + int64(len(b.data)) + 1
+		if int64(len(b.data)) == b.f.blockSize {
+			if b.f.size < curOffset {
+				err = b.f.rawTruncate(curOffset)
+				if err != nil {
+					return err
+				}
+			}
+		}
 	} else {
 		b.prepareWrite()
 
@@ -208,17 +268,16 @@ func (b *block) store(truncate bool) (err error) {
 		bb := buf.Bytes()
 		n := len(bb)
 		if n+1 < len(b.data)-2*4096 { // save at least 2 blocks
-			_, err = b.f.f.WriteAt(bb, headerSize+b.num*(b.f.blockSize+1))
+			_, err = b.f.rawWriteAt(bb, headerSize+b.num*(b.f.blockSize+1))
 			if err != nil {
 				return err
 			}
-
 			curOffset = headerSize + b.num*(b.f.blockSize+1) + int64(n)
 		} else {
 			buf.Reset()
 			buf.WriteByte(blkUncompressed)
 			buf.Write(b.data)
-			_, err = b.f.f.WriteAt(buf.Bytes(), headerSize+b.num*(b.f.blockSize+1))
+			_, err = b.f.rawWriteAt(buf.Bytes(), headerSize+b.num*(b.f.blockSize+1))
 			curOffset = headerSize + b.num*(b.f.blockSize+1) + int64(len(b.data)) + 1
 		}
 	}
@@ -229,25 +288,16 @@ func (b *block) store(truncate bool) (err error) {
 
 	b.dirty = false
 
-	if truncate {
-		err = b.f.f.Truncate(curOffset)
-	} else {
-		if int64(len(b.data)) < b.f.blockSize {
-			// last block
-			err = b.f.f.Truncate(curOffset)
-		} else {
-			endOfBlock := headerSize + (b.num+1)*(b.f.blockSize+1)
-			if holeSize := endOfBlock - curOffset; holeSize > 0 {
-				err = b.f.f.PunchHole(curOffset, holeSize)
-			}
-		}
+	if int64(len(b.data)) < b.f.blockSize {
+		// last block
+		err = b.f.rawTruncate(curOffset)
 	}
 
 	return
 }
 
 func (b *block) prepareWrite() {
-	if b.blockIsRaw {
+	if b.dataIsRaw {
 		if b.dataBlock == nil {
 			b.dataBlock = make([]byte, len(b.data), b.f.blockSize)
 		} else {
@@ -255,7 +305,7 @@ func (b *block) prepareWrite() {
 		}
 		copy(b.dataBlock, b.data)
 		b.data = b.dataBlock
-		b.blockIsRaw = false
+		b.dataIsRaw = false
 	}
 }
 
@@ -283,6 +333,9 @@ func (f *SpgzFile) Read(buf []byte) (n int, err error) {
 }
 
 func (f *SpgzFile) ReadAt(buf []byte, offset int64) (n int, err error) {
+	if offset < 0 {
+		return 0, os.ErrInvalid
+	}
 	f.Lock()
 	for n < len(buf) {
 		err = f.loadAt(offset)
@@ -299,19 +352,124 @@ func (f *SpgzFile) ReadAt(buf []byte, offset int64) (n int, err error) {
 	return
 }
 
+func (f *SpgzFile) loadBlockFromQueue(num int64, block *block, full bool) (bool, error) {
+	if len(f.writeQueue) > 0 {
+		// Try to copy from the writeQueue if the block is there
+		idx := num - f.writeQueue[0].num
+		if idx >= 0 && idx < int64(len(f.writeQueue)) {
+			b := &f.writeQueue[idx]
+			if full {
+				err := b.readTail()
+				if err != nil {
+					return true, err
+				}
+			}
+			if block.dataBlock == nil {
+				block.dataBlock = make([]byte, 0, f.blockSize)
+				block.data = block.dataBlock
+				block.dataIsRaw = false
+			}
+			block.data = block.data[:len(b.data)]
+			copy(block.data, b.data)
+			block.num = num
+			block.dirty = false
+			block.full = b.full
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (f *SpgzFile) loadBlock(num int64, block *block) error {
+	if found, err := f.loadBlockFromQueue(num, block, true); found {
+		return err
+	}
+	return block.load(num)
+}
+
+func (f *SpgzFile) loadNum(num int64) error {
+	if f.loaded && f.block.dirty {
+		err := f.storeBlock()
+		if err != nil {
+			return err
+		}
+	}
+	err := f.loadBlock(num, &f.block)
+	f.loaded = err == nil || err == io.EOF
+	return err
+}
+
 func (f *SpgzFile) loadAt(offset int64) error {
 	num := offset / f.blockSize
 	if num != f.block.num || !f.loaded {
-		if f.loaded && f.block.dirty {
-			err := f.block.store(false)
+		return f.loadNum(num)
+	}
+	return f.block.readTail()
+}
+
+// moves the data and properties from the other block invalidating it
+func (b *block) assign(other *block) {
+	b.f = other.f
+	b.num = other.num
+	b.data, other.data = other.data, b.data
+	b.rawBlock, other.rawBlock = other.rawBlock, b.rawBlock
+	b.dataBlock, other.dataBlock = other.dataBlock, b.dataBlock
+	b.dataIsRaw = other.dataIsRaw
+	b.dirty = other.dirty
+	b.full = other.full
+}
+
+func (f *SpgzFile) flushWriteQueue() error {
+	if len(f.writeQueue) > 0 {
+		for i := range f.writeQueue {
+			err := f.writeQueue[i].readTail()
 			if err != nil {
 				return err
 			}
 		}
-		err := f.block.load(num)
-		f.loaded = err == nil || err == io.EOF
-		return err
+		holeStart := headerSize + f.writeQueue[0].num*(f.blockSize+1)
+		holeSize := int64(len(f.writeQueue)) * (f.blockSize + 1)
+		err := f.f.PunchHole(holeStart, holeSize)
+		if err != nil {
+			return err
+		}
+		for i := range f.writeQueue {
+			err := f.writeQueue[i].store()
+			if err != nil {
+				return err
+			}
+		}
+		f.writeQueue = f.writeQueue[:0]
 	}
+	return nil
+}
+
+func (f *SpgzFile) storeBlock() error {
+	var idx int64
+	if len(f.writeQueue) > 0 {
+		idx = f.block.num - f.writeQueue[0].num
+		if len(f.writeQueue) == cap(f.writeQueue) || idx < 0 || idx > int64(len(f.writeQueue)) {
+			err := f.flushWriteQueue()
+			if err != nil {
+				return err
+			}
+			idx = 0
+		}
+	}
+	if idx == int64(len(f.writeQueue)) {
+		if len(f.writeQueue) > 0 {
+			lastBlock := &f.writeQueue[len(f.writeQueue)-1]
+			if int64(len(lastBlock.data)) < f.blockSize {
+				err := lastBlock.expandToFullSize()
+				if err != nil {
+					return err
+				}
+			}
+		}
+		f.writeQueue = f.writeQueue[:idx+1]
+	}
+	f.writeQueue[idx].assign(&f.block)
+	f.loaded = false
 	return nil
 }
 
@@ -322,30 +480,35 @@ func (f *SpgzFile) write(buf []byte, offset int64) (n int, err error) {
 	for len(buf) > 0 {
 		num := offset / f.blockSize
 		o := offset - num*f.blockSize
+
 		if num != f.block.num || !f.loaded {
 			if f.loaded && f.block.dirty {
-				err = f.block.store(false)
+				err = f.storeBlock()
 				if err != nil {
 					return
 				}
 			}
-			if o == 0 && int64(len(buf)) >= f.blockSize {
-				// The block is overwritten completely, there is no need to load it first
+			if found, err := f.loadBlockFromQueue(num, &f.block, false); found {
+				if err != nil {
+					return 0, err
+				}
+			} else {
 				f.block.num = num
 				if f.block.dataBlock == nil {
-					f.block.dataBlock = make([]byte, f.blockSize)
+					f.block.dataBlock = make([]byte, 0, f.blockSize)
 				}
 				f.block.data = f.block.dataBlock[:0]
-			} else {
-				err = f.block.load(num)
-				if err != nil {
-					if err != io.EOF {
-						return
-					}
-					err = nil
-				}
+				f.block.dataIsRaw = false
+				f.block.dirty = false
+				f.block.full = false
 			}
 			f.loaded = true
+		}
+		if o > int64(len(f.block.data)) {
+			err = f.block.readTail()
+			if err != nil {
+				return
+			}
 		}
 
 		newBlockSize := o + int64(len(buf))
@@ -378,17 +541,99 @@ func (f *SpgzFile) Write(buf []byte) (n int, err error) {
 }
 
 func (f *SpgzFile) WriteAt(buf []byte, offset int64) (n int, err error) {
+	if offset < 0 {
+		return 0, os.ErrInvalid
+	}
 	f.Lock()
 	n, err = f.write(buf, offset)
 	f.Unlock()
 	return
 }
 
+func (f *SpgzFile) rawTruncate(size int64) error {
+	if f.size == size {
+		return nil
+	}
+	err := f.f.Truncate(size)
+	if err == nil {
+		f.size = size
+	}
+	return err
+}
+
+func (f *SpgzFile) rawWriteAt(b []byte, o int64) (int, error) {
+	n, err := f.f.WriteAt(b, o)
+	newSize := o + int64(n)
+	if newSize > f.size {
+		f.size = newSize
+	}
+	return n, err
+}
+
+// When a block is discarded before its contents is written because it falls in a hole we still need to ensure
+// the file is expanded to the same size as if the block was actually written.
+func (f *SpgzFile) expandToBlockSize(b *block) error {
+	if int64(len(b.data)) < f.blockSize {
+		return f.rawTruncate(headerSize + b.num*(f.blockSize+1) + int64(len(b.data)) + 1)
+	}
+	reqSize := headerSize + (b.num+1)*(f.blockSize+1)
+	if f.size < reqSize {
+		return f.rawTruncate(reqSize)
+	}
+	return nil
+}
+
 func (f *SpgzFile) PunchHole(offset, size int64) error {
-	num := offset / f.blockSize
-	l := offset - num*f.blockSize
+	if offset < 0 || size < 0 {
+		return os.ErrInvalid
+	}
+	if size == 0 {
+		return nil
+	}
+	startZeroBlock := offset / f.blockSize
+	l := offset - startZeroBlock*f.blockSize
+	if l > 0 {
+		startZeroBlock++
+	}
+	endZeroBlock := (offset + size) / f.blockSize
 	f.Lock()
 	defer f.Unlock()
+	if len(f.writeQueue) > 0 {
+		// Adjusting the writeQueue either by filling the affected blocks with zeros or by discarding tail blocks
+		startIdx := startZeroBlock - f.writeQueue[0].num
+		bl := int64(len(f.writeQueue))
+		if startIdx < bl {
+			if endIdx := endZeroBlock - f.writeQueue[0].num; endIdx > 0 {
+				if startIdx < 0 {
+					startIdx = 0
+				}
+				if endIdx >= bl {
+					// The tail can be discarded
+					err := f.expandToBlockSize(&f.writeQueue[len(f.writeQueue)-1])
+					if err != nil {
+						return err
+					}
+					f.writeQueue = f.writeQueue[:startIdx]
+				} else {
+					sec := f.writeQueue[startIdx:endIdx]
+					for i := range sec {
+						b := &sec[i]
+						for j := range b.data {
+							b.data[j] = 0
+						}
+					}
+				}
+			}
+		}
+	}
+	if f.loaded && f.block.num >= startZeroBlock && f.block.num < endZeroBlock {
+		// The currently loaded block falls in the hole, discard it
+		err := f.expandToBlockSize(&f.block)
+		if err != nil {
+			return err
+		}
+		f.loaded = false
+	}
 	if l > 0 {
 		err := f.loadAt(offset)
 		if err != nil {
@@ -411,19 +656,12 @@ func (f *SpgzFile) PunchHole(offset, size int64) error {
 		l = int64(len(tail))
 		offset += l
 		size -= l
-		num++
 	}
 
-	blocks := size / f.blockSize
-
-	if blocks > 0 {
-		err := f.f.PunchHole(headerSize+num*(f.blockSize+1), blocks*(f.blockSize+1))
+	if blocks := endZeroBlock - startZeroBlock; blocks > 0 {
+		err := f.f.PunchHole(headerSize+startZeroBlock*(f.blockSize+1), blocks*(f.blockSize+1))
 		if err != nil {
 			return err
-		}
-		if f.loaded && f.block.num >= num && f.block.num < num+blocks {
-			// The currently loaded block falls in the hole, discard it
-			f.loaded = false
 		}
 		l = blocks * f.blockSize
 		offset += l
@@ -452,49 +690,84 @@ func (f *SpgzFile) PunchHole(offset, size int64) error {
 }
 
 func (f *SpgzFile) Size() (int64, error) {
-	o, err := f.f.Seek(0, io.SeekEnd)
-	if err != nil {
-		return 0, err
-	}
-	if o < headerSize {
-		o = headerSize
-	}
-	lastBlockNum := (o - headerSize) / (f.blockSize + 1)
 	f.Lock()
 	defer f.Unlock()
-	if f.loaded && f.block.num >= lastBlockNum {
-		return f.block.num*f.blockSize + int64(len(f.block.data)), nil
+	var lastBlock *block
+	// Try to get the last block either from the writeQueue or from the currently loaded block
+	if len(f.writeQueue) > 0 {
+		lastBlock = &f.writeQueue[len(f.writeQueue)-1]
+	}
+	if f.loaded && (lastBlock == nil || f.block.num >= lastBlock.num) {
+		lastBlock = &f.block
+	}
+	if lastBlock != nil && int64(len(lastBlock.data)) == f.blockSize {
+		lastBlock = nil
 	}
 
-	b := &block{
-		f: f,
+	if lastBlock == nil {
+		o := f.size
+		if f.size < headerSize {
+			o = headerSize
+		}
+		lastBlockNum := (o - headerSize) / (f.blockSize + 1)
+		lastBlock = &f.tmpBlock
+
+		err := f.loadBlock(lastBlockNum, lastBlock)
+		if err != nil {
+			if err == io.EOF {
+				return lastBlockNum * f.blockSize, nil
+			}
+			return 0, err
+		}
+	} else {
+		err := lastBlock.readTail()
+		if err != nil {
+			return 0, err
+		}
 	}
 
-	err = b.load(lastBlockNum)
-
-	if err != nil && err != io.EOF {
-		return 0, err
-	}
-	return lastBlockNum*f.blockSize + int64(len(b.data)), nil
+	return lastBlock.num*f.blockSize + int64(len(lastBlock.data)), nil
 }
 
 func (f *SpgzFile) Seek(offset int64, whence int) (int64, error) {
+	newOffset := f.offset
 	switch whence {
 	case io.SeekStart:
-		f.offset = offset
-		return f.offset, nil
+		newOffset = offset
 	case io.SeekCurrent:
-		f.offset += offset
-		return f.offset, nil
+		newOffset += offset
 	case io.SeekEnd:
 		size, err := f.Size()
 		if err != nil {
-			return f.offset, err
+			return newOffset, err
 		}
-		f.offset = size + offset
-		return f.offset, nil
+		newOffset = size + offset
+	default:
+		return newOffset, os.ErrInvalid
 	}
-	return f.offset, os.ErrInvalid
+	if newOffset < 0 {
+		return newOffset, os.ErrInvalid
+	}
+	f.offset = newOffset
+	return newOffset, nil
+}
+
+// Expand the block to full size by padding it with zeros. This is done when the block used to be the last one,
+// but there is another one written after it.
+func (b *block) expandToFullSize() error {
+	err := b.readTail()
+	if err != nil {
+		return err
+	}
+	tail := b.data[len(b.data):b.f.blockSize]
+	if len(tail) > 0 {
+		for i := range tail {
+			tail[i] = 0
+		}
+		b.data = b.data[:b.f.blockSize]
+		b.dirty = true
+	}
+	return nil
 }
 
 func (f *SpgzFile) Truncate(size int64) error {
@@ -504,50 +777,58 @@ func (f *SpgzFile) Truncate(size int64) error {
 
 	f.Lock()
 	defer f.Unlock()
-
-	if f.loaded && f.block.num == blockNum {
-		b = &f.block
-	} else {
-		if f.loaded && f.block.num < blockNum && int64(len(f.block.data)) < f.blockSize {
-			// The last block which is loaded is no longer last, expand it with zeros
-			tail := f.block.data[len(f.block.data):f.blockSize]
-			for i := range tail {
-				tail[i] = 0
-			}
-			f.block.data = f.block.data[:f.blockSize]
-			f.block.dirty = true
-		}
-		if newLen != 0 {
-			b = &block{
-				f: f,
-			}
-			err := b.load(blockNum)
+	if f.loaded {
+		if f.block.num == blockNum {
+			b = &f.block
+		} else if f.block.num < blockNum {
+			err := f.block.expandToFullSize()
 			if err != nil {
-				if err == io.EOF {
-					b = nil
+				return err
+			}
+		} else {
+			f.loaded = false
+		}
+	}
+	if len(f.writeQueue) > 0 {
+		idx := blockNum - f.writeQueue[0].num
+		if idx < 0 {
+			f.writeQueue = f.writeQueue[:0]
+		} else {
+			if idx < int64(len(f.writeQueue)) {
+				if newLen > 0 {
+					f.writeQueue = f.writeQueue[:idx+1]
+					if b == nil {
+						b = &f.writeQueue[idx]
+					}
 				} else {
+					f.writeQueue = f.writeQueue[:idx]
+				}
+			}
+			idx--
+			if idx >= 0 && idx < int64(len(f.writeQueue)) {
+				err := f.writeQueue[idx].expandToFullSize()
+				if err != nil {
 					return err
 				}
 			}
 		}
+	}
+	if newLen > 0 {
 		if b == nil {
-			// Truncating beyond the current EOF (i.e. expanding)
-			if newLen > 0 {
-				// Add one byte (which will be zero) to indicate an uncompressed block
-				newLen++
+			err := f.loadNum(blockNum)
+			if err != nil {
+				if err != io.EOF {
+					return err
+				}
+				return f.rawTruncate(headerSize + blockNum*(f.blockSize+1) + int64(newLen) + 1)
 			}
-			err := f.f.Truncate(headerSize + blockNum*(f.blockSize+1) + int64(newLen))
+			b = &f.block
+		} else if len(b.data) < newLen {
+			err := b.readTail()
 			if err != nil {
 				return err
 			}
-			if f.loaded && f.block.num > blockNum {
-				f.loaded = false
-			}
-			return nil
 		}
-	}
-
-	if b == &f.block {
 		if newLen != len(b.data) {
 			if newLen > len(b.data) {
 				tail := b.data[len(b.data):newLen]
@@ -558,19 +839,11 @@ func (f *SpgzFile) Truncate(size int64) error {
 			b.data = b.data[:newLen]
 			b.dirty = true
 		}
-	} else {
-		b.data = b.data[:newLen]
-		err := b.store(true)
-		if err != nil {
-			return err
+		if !b.dirty {
+			return nil
 		}
 	}
-
-	if f.loaded && f.block.num > blockNum {
-		f.loaded = false
-	}
-
-	return nil
+	return f.rawTruncate(headerSize + blockNum*(f.blockSize+1))
 }
 
 func (f *SpgzFile) WriteTo(w io.Writer) (n int64, err error) {
@@ -640,15 +913,22 @@ func (f *SpgzFile) ReadFrom(rd io.Reader) (n int64, err error) {
 	}
 }
 
-func (f *SpgzFile) Sync() error {
-	f.Lock()
-	defer f.Unlock()
-
-	if f.block.dirty {
-		err := f.block.store(false)
+func (f *SpgzFile) flush() error {
+	if f.loaded && f.block.dirty {
+		err := f.storeBlock()
 		if err != nil {
 			return err
 		}
+	}
+	return f.flushWriteQueue()
+}
+
+func (f *SpgzFile) Sync() error {
+	f.Lock()
+	defer f.Unlock()
+	err := f.flush()
+	if err != nil {
+		return err
 	}
 	return f.f.Sync()
 }
@@ -657,12 +937,11 @@ func (f *SpgzFile) Close() error {
 	f.Lock()
 	defer f.Unlock()
 
-	if f.block.dirty {
-		err := f.block.store(false)
-		if err != nil {
-			return err
-		}
+	err := f.flush()
+	if err != nil {
+		return err
 	}
+
 	return f.f.Close()
 }
 
@@ -734,8 +1013,15 @@ func (f *SpgzFile) init(flag int, blockSize int64) error {
 		bs := binary.LittleEndian.Uint32(buf[8:])
 		blockSize = int64(bs*4096) - 1
 	}
+	f.size, err = f.f.Seek(0, io.SeekEnd)
+	if err != nil {
+		return err
+	}
 	f.blockSize = blockSize
 	f.block.init(f)
+	f.tmpBlock.init(f)
+	f.writeQueue = make([]block, 0, writeQueueSize)
+	f.gzReader = new(gzip.Reader)
 	return nil
 }
 
@@ -761,7 +1047,7 @@ func OpenFileSize(name string, flag int, perm os.FileMode, blockSize int64) (f *
 
 	err = f.init(flag, blockSize)
 	if err != nil {
-		f.f.Close()
+		_ = f.f.Close()
 		return nil, err
 	}
 
