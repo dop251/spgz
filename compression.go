@@ -295,7 +295,7 @@ func (b *block) prepareStore() (err error) {
 			if b.f.size < curOffset {
 				err = b.f.rawTruncate(curOffset)
 				if err != nil {
-					return err
+					return
 				}
 			}
 		}
@@ -316,7 +316,7 @@ func (b *block) prepareStore() (err error) {
 		// last block
 		err = b.f.rawTruncate(curOffset)
 	}
-	return nil
+	return
 }
 
 func (b *block) store() (err error) {

@@ -5,12 +5,16 @@ package main
 
 import log "github.com/sirupsen/logrus"
 
-var noBuse = ""
+const buseAvailable = false
 
-func getBuseFlag() *string {
-	return &noBuse
+var noBuse = ""
+var noBuseBlockSize int
+var noBuseReadOnly bool
+
+func getBuseFlags() (*string, *int, *bool) {
+	return &noBuse, &noBuseBlockSize, &noBuseReadOnly
 }
 
-func doBuse(_, _ string) {
-	log.Fatal("Buse only available in Linux")
+func doBuse(_, _ string, _ int, _ bool) {
+	log.Fatal("BUSE only available in Linux")
 }

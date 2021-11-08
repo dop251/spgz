@@ -13,8 +13,12 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-func getBuseFlag() *string {
-	return flag.String("b", "", "Connect to a local nbd device")
+const buseAvailable = true
+
+func getBuseFlags() (*string, *int, *bool) {
+	return flag.String("b", "", "BUSE mode: connect the `file` to a local nbd device (specified by arg)"),
+		flag.Int("buse-block-size", 512, "Block (sector) `size` for BUSE device"),
+		flag.Bool("buse-readonly", false, "Open file in read-only mode")
 }
 
 func checkDev(dev string) error {
@@ -34,8 +38,14 @@ func checkDev(dev string) error {
 	return nil
 }
 
-func doBuse(file, dev string) {
-	f, err := spgz.OpenFile(file, os.O_RDWR, 0666)
+func doBuse(file, dev string, blockSize int, readOnly bool) {
+	var mode int
+	if readOnly {
+		mode = os.O_RDONLY
+	} else {
+		mode = os.O_RDWR
+	}
+	f, err := spgz.OpenFile(file, mode, 0666)
 	if err != nil {
 		log.Fatalf("Could not open file: %v", err)
 	}
@@ -52,7 +62,9 @@ func doBuse(file, dev string) {
 	if err != nil {
 		log.Fatalf("Could not create a device: %v", err)
 	}
-
+	if blockSize > 0 {
+		device.SetBlockSize(blockSize)
+	}
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt)
 	disc := make(chan error, 1)

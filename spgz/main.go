@@ -20,10 +20,12 @@ const (
 )
 
 func usage() {
-	s := "Compress:\n    %[1]s -c <compressed_file> <source>\n\nExtract:\n    %[1]s -x <compressed_file> [--no-sparse] <target>\n\n" +
-		"Get original size:\n    %[1]s -s <compressed_file>\n\nConnect to a local nbd device:\n    %[1]s -b <compressed_file> /dev/nbd...\n"
-
-	fmt.Fprintf(os.Stderr, s, os.Args[0])
+	buseFlag := ""
+	if buseAvailable {
+		buseFlag = "b"
+	}
+	fmt.Printf("Usage: %s [-cxs%s] file [options] arg\n\n", os.Args[0], buseFlag)
+	flag.PrintDefaults()
 	os.Exit(1)
 }
 
@@ -52,10 +54,10 @@ func failOptions() {
 }
 
 func main() {
-	var buse = getBuseFlag()
-	var create = flag.String("c", "", "Create compressed file")
-	var extract = flag.String("x", "", "Extract compressed file")
-	var size = flag.String("s", "", "Get original size in bytes")
+	var buse, blockSize, readOnly = getBuseFlags()
+	var create = flag.String("c", "", "Create compressed `file`")
+	var extract = flag.String("x", "", "Extract compressed `file`")
+	var size = flag.String("s", "", "Get original size of `file` in bytes")
 	var noSparse = flag.Bool("no-sparse", false, "Disable sparse file")
 	var debug = flag.Bool("debug", false, "Enable debug logging")
 
@@ -165,7 +167,7 @@ func main() {
 			log.Fatalf("Close failed: %v", err)
 		}
 	} else if *buse != "" {
-		doBuse(*buse, name)
+		doBuse(*buse, name, *blockSize, *readOnly)
 	} else if *size != "" {
 		f, err := spgz.OpenFile(*size, os.O_RDONLY, 0666)
 		if err != nil {
