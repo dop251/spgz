@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"sync"
 )
 
@@ -33,6 +34,53 @@ var (
 	ErrFileIsDirectory       = errors.New("file cannot be a directory")
 	ErrWriteOnlyNotSupported = errors.New("write only mode is not supported")
 )
+
+type compressor interface {
+	CompressAsync(src []byte, dst *[]byte, result chan<- error)
+}
+
+type gzipCompressor struct {
+	writers chan *gzip.Writer
+}
+
+func (c *gzipCompressor) CompressAsync(src []byte, dst *[]byte, result chan<- error) {
+	go func() {
+		zw := <-c.writers
+		defer func() {
+			c.writers <- zw
+		}()
+
+		buf := bytes.NewBuffer(*dst)
+		zw.Reset(buf)
+
+		reader := bytes.NewBuffer(src)
+
+		buf.WriteByte(blkCompressed)
+
+		_, err := io.Copy(zw, reader)
+		if err != nil {
+			result <- err
+			return
+		}
+		err = zw.Close()
+		if err != nil {
+			result <- err
+			return
+		}
+		*dst = buf.Bytes()
+		result <- nil
+	}()
+}
+
+func newGzipCompressor(writers int) *gzipCompressor {
+	c := &gzipCompressor{
+		writers: make(chan *gzip.Writer, writers),
+	}
+	for i := 0; i < writers; i++ {
+		c.writers <- gzip.NewWriter(nil)
+	}
+	return c
+}
 
 // ErrCorruptCompressedBlock is returned when a compressed block involved in a read or a write operation is
 // corrupt (for example as a result of a partial write). Note, this is not a media error.
@@ -67,6 +115,7 @@ type block struct {
 	num                 int64
 	data                []byte
 	rawBlock, dataBlock []byte
+	ch                  chan error
 	// True when data is pointing to rawBlock rather than dataBlock.
 	dataIsRaw bool
 	dirty     bool
@@ -84,7 +133,10 @@ type SpgzFile struct {
 
 	block    block
 	tmpBlock block
-	gzReader *gzip.Reader
+
+	gzReader   *gzip.Reader
+	compressor compressor
+
 	// Contains a list of consecutive blocks ready to be written. When the queue is flushed, first a single
 	// hole is punched across the whole area, then individual blocks are written. This helps reduce the number
 	// of fallocate() calls which seem to be quite expensive, at least on btrfs.
@@ -232,7 +284,7 @@ func (b *block) loadCompressed(tail bool) error {
 	return nil
 }
 
-func (b *block) store() (err error) {
+func (b *block) prepareStore() (err error) {
 	var curOffset int64
 
 	if len(b.data) == 0 {
@@ -249,43 +301,56 @@ func (b *block) store() (err error) {
 		}
 	} else {
 		b.prepareWrite()
-
-		buf := bytes.NewBuffer(b.rawBlock[:0])
-
-		reader := bytes.NewBuffer(b.data)
-
-		buf.WriteByte(blkCompressed)
-
-		w := gzip.NewWriter(buf)
-		_, err = io.Copy(w, reader)
-		if err != nil {
-			return err
-		}
-		err = w.Close()
-		if err != nil {
-			return err
-		}
-		bb := buf.Bytes()
-		n := len(bb)
-		if n+1 < len(b.data)-2*4096 { // save at least 2 blocks
-			_, err = b.f.rawWriteAt(bb, headerSize+b.num*(b.f.blockSize+1))
-			if err != nil {
-				return err
-			}
-			curOffset = headerSize + b.num*(b.f.blockSize+1) + int64(n)
+		if b.rawBlock == nil {
+			b.rawBlock = make([]byte, 0, b.f.blockSize+1)
 		} else {
-			buf.Reset()
-			buf.WriteByte(blkUncompressed)
-			buf.Write(b.data)
-			_, err = b.f.rawWriteAt(buf.Bytes(), headerSize+b.num*(b.f.blockSize+1))
-			curOffset = headerSize + b.num*(b.f.blockSize+1) + int64(len(b.data)) + 1
+			b.rawBlock = b.rawBlock[:0]
+		}
+		b.ch = make(chan error, 1)
+		b.f.compressor.CompressAsync(b.data, &b.rawBlock, b.ch)
+		return nil
+	}
+	b.dirty = false
+
+	if int64(len(b.data)) < b.f.blockSize {
+		// last block
+		err = b.f.rawTruncate(curOffset)
+	}
+	return nil
+}
+
+func (b *block) store() (err error) {
+	if !b.dirty {
+		return
+	}
+	if b.ch == nil {
+		err = b.prepareStore()
+		if err != nil {
+			return
+		}
+		if !b.dirty {
+			return nil
 		}
 	}
-
+	err = <-b.ch
+	b.ch = nil
+	if err != nil {
+		return
+	}
+	n := len(b.rawBlock)
+	var curOffset int64
+	if n+1 < len(b.data)-2*4096 { // save at least 2 blocks
+		curOffset = headerSize + b.num*(b.f.blockSize+1) + int64(n)
+	} else {
+		b.rawBlock = b.rawBlock[:len(b.data)+1]
+		b.rawBlock[0] = blkUncompressed
+		copy(b.rawBlock[1:], b.data)
+		curOffset = headerSize + b.num*(b.f.blockSize+1) + int64(len(b.data)) + 1
+	}
+	_, err = b.f.rawWriteAt(b.rawBlock, headerSize+b.num*(b.f.blockSize+1))
 	if err != nil {
 		return err
 	}
-
 	b.dirty = false
 
 	if int64(len(b.data)) < b.f.blockSize {
@@ -422,7 +487,12 @@ func (b *block) assign(other *block) {
 func (f *SpgzFile) flushWriteQueue() error {
 	if len(f.writeQueue) > 0 {
 		for i := range f.writeQueue {
-			err := f.writeQueue[i].readTail()
+			b := &f.writeQueue[i]
+			err := b.readTail()
+			if err != nil {
+				return err
+			}
+			err = b.prepareStore()
 			if err != nil {
 				return err
 			}
@@ -1022,6 +1092,7 @@ func (f *SpgzFile) init(flag int, blockSize int64) error {
 	f.tmpBlock.init(f)
 	f.writeQueue = make([]block, 0, writeQueueSize)
 	f.gzReader = new(gzip.Reader)
+	f.compressor = newGzipCompressor(runtime.NumCPU())
 	return nil
 }
 
