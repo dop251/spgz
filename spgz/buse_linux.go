@@ -62,9 +62,11 @@ func doBuse(file, dev string, blockSize int, readOnly bool) {
 	if err != nil {
 		log.Fatalf("Could not create a device: %v", err)
 	}
+	device.SetLogger(log.StandardLogger())
 	if blockSize > 0 {
 		device.SetBlockSize(blockSize)
 	}
+	device.SetReadOnly(readOnly)
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, os.Interrupt)
 	disc := make(chan error, 1)
